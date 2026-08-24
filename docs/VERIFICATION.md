@@ -40,7 +40,7 @@ vergerail = { path = "../vergerail" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-처음에는 `cargo check`로 consumer lockfile을 만들고, 이후 `cargo check --locked`를 사용합니다. GitHub 배포 뒤에는 path를 검증한 remote의 full commit SHA로 바꿔 같은 검사를 반복합니다.
+처음에는 `cargo check`로 consumer lockfile을 만들고, 이후 `cargo check --locked`를 사용합니다. 공개 GitHub consumer는 검증한 remote의 full commit SHA로 고정해 두 검사를 수행합니다. 이후 release에서도 같은 검사를 새 full SHA로 반복합니다.
 
 ## 실제 계정 E2E
 
@@ -78,12 +78,12 @@ E2E는 sandbox 검증용 임시 root만 변경합니다. 판정은 모델 설명
 2026-08-24 Apple silicon macOS, Rust `1.97.1`, Codex `0.149.1` 공식
 `aarch64-apple-darwin` package에서 다음을 확인했습니다.
 
-- source identity: receipt 수집 시점의 `/Users/ax/repoGithub/vergerail` working
-  tree입니다. 이 문서는 commit SHA를 self-reference하지 않으며, local release
-  commit 이후에는 `scripts/release-verify.sh`가 clean committed `HEAD`에서
-  같은 production inputs와 official/managed/live external suites를 다시
-  실행해 release evidence를 해당 commit에 bind합니다. GitHub remote consumer
-  검증은 remote가 생성된 뒤 full commit SHA로 별도 수행합니다.
+- source identity: receipt 수집 시점의 canonical 공개 repository와
+  `/Users/ax/repoGithub/vergerail` clean working tree입니다. 이 문서는 commit
+  SHA를 self-reference하지 않으며, `scripts/release-verify.sh`가 clean
+  committed `HEAD`에서 같은 production inputs와 official/managed/live
+  external suites를 실행해 release evidence를 해당 commit에 bind합니다.
+  공개 GitHub remote consumer도 별도 full commit SHA 검증을 통과했습니다.
 
 - `scripts/verify.sh` exit `0`: fmt, locked all-target checks/tests, doctest,
   Clippy, rustdoc, cargo-deny, protocol SHA-256와 package verification
@@ -98,8 +98,9 @@ E2E는 sandbox 검증용 임시 root만 변경합니다. 판정은 모델 설명
   동일 실행의 immediate 및 +5초 process scan에서 live harness, guardian,
   Codex와 code-mode-host survivor가 각각 `0`건이었습니다. 일반 `~/.codex`나
   credential 내용은 사용·출력하지 않았습니다.
-- package 목록 56개에 새 protocol provenance, target-neutral guardian stub와 third-party notice가 포함되고
-  credential, `target`, runtime binary는 제외됨
+- package 검증에는 protocol provenance, target-neutral guardian stub와
+  third-party notice가 포함되고 credential, `target`, runtime binary는
+  제외됨
 - official package URL의 archive `114152335` bytes / SHA-256
   `151f8b96af0529c1267e7438d2cbc6d26213922fa017b96540abaf5f07d792d2`를 다시
   확인했으며, managed download/reuse ignored test도 `1 passed`입니다.
@@ -114,12 +115,13 @@ E2E는 sandbox 검증용 임시 root만 변경합니다. 판정은 모델 설명
   isolated build가 모두 같은 bytes/SHA를 냈고, production helper의 legacy
   문자열·심볼은 모두 부재했습니다.
 - current candidate에서 `scripts/verify.sh` exit `0`, 기본 테스트 155개,
-  package 목록 56개를 다시 확인했습니다. 공식 runtime 2개, IFSC signed-out
+  package 목록 57개를 다시 확인했습니다. 공식 runtime 2개, IFSC signed-out
   1개, managed download/reuse 1개도 current package로 exit `0`입니다.
 
-이 증거는 receipt 수집 시점의 local source와 고정 runtime 실사용을 지지합니다.
-GitHub remote push 또는 crates.io package 배포 증거가 아니며, release commit의
-최종 증거는 `scripts/release-verify.sh` 재실행 결과로 판단합니다.
+이 증거는 receipt 수집 시점의 local source, 공개 GitHub source와 고정 runtime
+실사용을 지지합니다. crates.io package 배포 증거는 아니며, 각 release commit의
+최종 증거는 `scripts/release-verify.sh` 재실행 결과와 matching remote
+full-SHA consumer 검증으로 판단합니다.
 
 ## 산출물 정리
 

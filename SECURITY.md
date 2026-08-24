@@ -45,7 +45,15 @@ refresh token을 복사해도 서버에서는 독립된 session이 아닙니다.
 
 ## 신고
 
-공개 보안 신고 경로는 아직 제공하지 않습니다. credential, OAuth URL, device code, prompt secret, `CODEX_HOME`을 issue나 source tree에 남기지 마세요. 배포 전에는 비공개 신고 경로와 security contact를 정해야 합니다.
+비공개 보안 신고는 GitHub Security Advisories의 private vulnerability
+reporting을 사용하세요:
+
+<https://github.com/axiom-orient/vergerail/security/advisories/new>
+
+취약점 세부 정보, credential, OAuth URL, device code, prompt secret,
+`CODEX_HOME`과 token은 public issue나 source tree에 남기지 마세요. 신고
+페이지를 사용할 수 없는 경우에도 민감한 내용을 public issue에 게시하지
+말고, repository owner가 제공하는 비공개 보안 채널을 사용하세요.
 
 ## 지원하지 않는 보안 구성
 

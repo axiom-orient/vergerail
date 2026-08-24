@@ -7,14 +7,19 @@ Vergerail `0.2.0`은 Codex `0.149.1`과 Apple silicon macOS만 지원합니다. 
 | 경로 | 판정 | 남은 조건 |
 |---|---|---|
 | local path dependency | `GO` | 없음 |
-| GitHub git dependency | `NO-GO` | canonical remote, 첫 commit, push된 SHA consumer 검증 |
-| crates.io | `NO-GO` | GitHub gate, package metadata, security contact, tag, publish dry-run |
+| GitHub git dependency | `GO` | 소비자가 검증된 full commit SHA를 고정해야 함 |
+| crates.io | `OUT OF SCOPE` | `publish = false`; 별도 게시 결정과 gate가 필요 |
 
-현재 local checkout에는 clean committed `HEAD`가 있고 release gate를 통과한
-receipt가 있습니다. 아직 GitHub remote 생성·push와 push된 full-SHA consumer
-검증은 수행하지 않았습니다. `Cargo.toml`의 repository, homepage와
-documentation URL은 `https://github.com/axiom-orient/vergerail`를 기준으로
-준비했으며, remote가 생긴 뒤 source consumer 검증을 추가로 수행합니다.
+현재 canonical source는 공개 저장소
+`https://github.com/axiom-orient/vergerail`이며 `main`에 clean committed
+source가 있습니다. public GitHub remote의 `main`과 local release commit이
+일치하고, 별도 HTTPS consumer가 검증한 full commit SHA를 고정해
+`cargo check`와 `cargo check --locked`를 통과했습니다. 소비자는 계속
+mutable branch나 tag가 아닌 각자 검증한 full SHA를 사용해야 합니다.
+
+`Cargo.toml`의 repository, homepage와 documentation URL은 canonical GitHub
+source를 가리킵니다. 현재는 crates.io 게시를 하지 않으며, tag와 release도
+생성하지 않습니다.
 
 GitHub Actions와 `.github/workflows`는 배포 수단으로 사용하지 않습니다. release 검증은 repository-owned `scripts/verify.sh`를 로컬에서 실행한 결과만 사용합니다.
 
@@ -36,8 +41,8 @@ checkout에서는 이 release entrypoint가 전제조건 오류로 종료하며,
 
 ## GitHub source
 
-1. 저장소 소유자가 canonical owner, repository 이름과 공개 범위를 결정합니다.
-2. `Cargo.toml.repository`와 문서 URL을 실제 remote에 맞춥니다.
+1. canonical owner, repository 이름과 공개 범위를 확인합니다.
+2. `Cargo.toml.repository`와 문서 URL이 실제 remote에 맞는지 확인합니다.
 3. clean commit에서 공통 gate를 다시 실행합니다.
 4. commit을 push한 뒤 별도 consumer가 full commit SHA를 고정해 `cargo check --locked`를 통과해야 합니다.
 
