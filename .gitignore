@@ -1,0 +1,57 @@
+# Rust and package outputs
+/target/
+/package-check/
+*.crate
+*.tgz
+*.profraw
+*.profdata
+/coverage/
+/tarpaulin-report.html
+/lcov.info
+
+# Local credentials and Codex state
+.env
+.env.*
+!.env.example
+auth.json
+vergerail-projects.json
+.vergerail-managed-home
+.vergerail-home.lock
+*.jsonl
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-wal
+*.db-shm
+*.pem
+*.key
+*.p12
+/.vergerail/
+/codex-home/
+/.codex-home/
+/runtime/vendor/
+/runtime/cache/
+.vergerail-download-*
+.vergerail-install-*
+
+# Editor and OS metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.fleet/
+.zed/
+*.swp
+*.swo
+*~
+
+# Temporary diagnostics
+*.log
+*.tmp
+*.temp
+*.bak
+*.old

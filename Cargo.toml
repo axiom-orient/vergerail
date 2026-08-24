@@ -1,0 +1,60 @@
+[package]
+name = "vergerail"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.97.1"
+description = "A pinned, type-safe Rust bridge to OpenAI Codex app-server"
+publish = false
+readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/axiom-orient/vergerail"
+homepage = "https://github.com/axiom-orient/vergerail"
+documentation = "https://github.com/axiom-orient/vergerail/tree/main/docs"
+keywords = ["codex", "agent", "openai", "json-rpc", "rust"]
+categories = ["api-bindings", "development-tools"]
+include = [
+    "build.rs",
+    "src/**/*.rs",
+    "src/native/**",
+    "tests/*.rs",
+    "examples/**",
+    "protocol/**",
+    "runtime/**",
+    "scripts/*.sh",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.md",
+    "SECURITY.md",
+    "docs/**",
+    "deny.toml",
+    "Cargo.toml",
+]
+
+[dependencies]
+flate2 = "1.1.9"
+fs2 = "0.4.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tar = "0.4.46"
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
+ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
+
+[build-dependencies]
+sha2 = "0.11.0"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["process"] }
+
+[dev-dependencies]
+shlex = "2.0.1"
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"

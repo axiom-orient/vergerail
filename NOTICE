@@ -1,0 +1,12 @@
+Vergerail
+Copyright 2026 Vergerail contributors
+
+This product includes material derived from OpenAI Codex.
+OpenAI Codex
+Copyright 2025 OpenAI
+
+OpenAI Codex includes code derived from Ratatui, licensed under the MIT License.
+Copyright (c) 2016-2022 Florian Dehau
+Copyright (c) 2023-2025 The Ratatui Developers
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and protocol/codex-0.149.1/PROVENANCE.toml.
