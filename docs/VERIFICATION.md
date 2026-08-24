@@ -87,7 +87,7 @@ E2E는 sandbox 검증용 임시 root만 변경합니다. 판정은 모델 설명
 
 - `scripts/verify.sh` exit `0`: fmt, locked all-target checks/tests, doctest,
   Clippy, rustdoc, cargo-deny, protocol SHA-256와 package verification
-- 기본 테스트 155개, IFSC unit 5개, IFSC protocol 5개, live harness unit 18개 통과
+- 기본 테스트 155개, IFSC unit 5개, IFSC protocol 5개, live harness unit 22개 통과
 - 공식 runtime ignored test 2개와 IFSC signed-out test 1개 통과
 - managed runtime download/install/reuse ignored test 1개 통과
 - isolated local path consumer의 최초 `cargo check`와 후속 `cargo check --locked` 통과

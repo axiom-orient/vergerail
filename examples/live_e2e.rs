@@ -160,7 +160,7 @@ async fn verify_text_only_boundary(codex: &Codex, workspace: &Path, model: &str)
         ApprovalMode::None,
     )
     .await?;
-    if observation.result_text.trim() != expected
+    if !matches_text_only_marker(&observation.result_text, expected)
         || observation.result_text.contains(&secret)
         || observation.target_item_id.is_some()
         || observation.saw_unexpected_item
@@ -172,6 +172,11 @@ async fn verify_text_only_boundary(codex: &Codex, workspace: &Path, model: &str)
         .into());
     }
     Ok(())
+}
+
+fn matches_text_only_marker(result: &str, expected: &str) -> bool {
+    let trimmed = result.trim();
+    trimmed == expected || trimmed.strip_suffix('.') == Some(expected)
 }
 
 async fn verify_interruption(codex: &Codex, workspace: &Path, model: &str) -> Result<()> {
@@ -929,7 +934,8 @@ fn require_exact_token(result: &vergerail::RunResult, token: &str) -> Result<()>
 mod tests {
     use super::{
         ApprovalMode, AuditTarget, LoopbackProbe, TurnObservation, denial_probe,
-        is_allowed_audited_unknown_method, macos_shell_command, observed_failure, observed_success,
+        is_allowed_audited_unknown_method, macos_shell_command, matches_text_only_marker,
+        observed_failure, observed_success,
     };
     use std::path::PathBuf;
     use vergerail::{CommandSummary, Diagnostic, FileChangeSummary, TurnAudit};
@@ -958,6 +964,48 @@ mod tests {
             denial_probe("touch '/tmp/marker'"),
             "if touch '/tmp/marker'; then exit 73; else exit 0; fi"
         );
+    }
+
+    #[test]
+    fn text_only_marker_accepts_exact_value() {
+        assert!(matches_text_only_marker(
+            "VERGERAIL_TEXT_ONLY_BOUNDARY_OK",
+            "VERGERAIL_TEXT_ONLY_BOUNDARY_OK"
+        ));
+    }
+
+    #[test]
+    fn text_only_marker_accepts_one_terminal_ascii_period() {
+        assert!(matches_text_only_marker(
+            "VERGERAIL_TEXT_ONLY_BOUNDARY_OK.",
+            "VERGERAIL_TEXT_ONLY_BOUNDARY_OK"
+        ));
+    }
+
+    #[test]
+    fn text_only_marker_accepts_surrounding_whitespace() {
+        assert!(matches_text_only_marker(
+            " \n\tVERGERAIL_TEXT_ONLY_BOUNDARY_OK.\r\n ",
+            "VERGERAIL_TEXT_ONLY_BOUNDARY_OK"
+        ));
+    }
+
+    #[test]
+    fn text_only_marker_rejects_prose_fences_and_multiple_markers() {
+        let expected = "VERGERAIL_TEXT_ONLY_BOUNDARY_OK";
+        for candidate in [
+            "before VERGERAIL_TEXT_ONLY_BOUNDARY_OK",
+            "VERGERAIL_TEXT_ONLY_BOUNDARY_OK after",
+            "```VERGERAIL_TEXT_ONLY_BOUNDARY_OK```",
+            "VERGERAIL_TEXT_ONLY_BOUNDARY_OK VERGERAIL_TEXT_ONLY_BOUNDARY_OK",
+            "VERGERAIL_TEXT_ONLY_BOUNDARY_OK..",
+            "VERGERAIL_TEXT_ONLY_BOUNDARY_OK!",
+        ] {
+            assert!(
+                !matches_text_only_marker(candidate, expected),
+                "{candidate:?}"
+            );
+        }
     }
 
     #[test]
