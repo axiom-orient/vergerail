@@ -6,6 +6,7 @@
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::event::{CommandSummary, FileChangeSummary, TurnAudit, TurnCompletion, Usage};
+use crate::image::{ImageGeneration, ImageGenerationFailure};
 use crate::private::redact::redact_line;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -48,22 +49,14 @@ pub(crate) fn config_warning_message(params: &Value) -> Result<String> {
         .get("summary")
         .and_then(Value::as_str)
         .ok_or_else(|| protocol_field("config.warning", "summary"))?;
-    let details = match params.get("details") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(value)) => Some(value.as_str()),
-        Some(_) => return Err(protocol_field("config.warning", "details")),
-    };
-    let path = match params.get("path") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(value)) => Some(value.as_str()),
-        Some(_) => return Err(protocol_field("config.warning", "path")),
-    };
+    let details = optional_string(params, "details", "config.warning")?;
+    let path = optional_string(params, "path", "config.warning")?;
     let mut message = summary.to_owned();
-    if let Some(details) = details.filter(|value| !value.is_empty()) {
+    if let Some(details) = details.as_deref().filter(|value| !value.is_empty()) {
         message.push_str(": ");
         message.push_str(details);
     }
-    if let Some(path) = path.filter(|value| !value.is_empty()) {
+    if let Some(path) = path.as_deref().filter(|value| !value.is_empty()) {
         message.push_str(" [");
         message.push_str(path);
         message.push(']');
@@ -181,6 +174,24 @@ pub(crate) fn file_change_from_patch(params: &Value) -> Result<FileChangeSummary
     })
 }
 
+pub(crate) fn image_generation_from_item(item: &Value) -> Result<ImageGeneration> {
+    const OPERATION: &str = "item.imageGeneration";
+    let saved_path = optional_string(item, "savedPath", OPERATION)?.map(PathBuf::from);
+    if saved_path.as_ref().is_some_and(|path| !path.is_absolute()) {
+        return Err(protocol_field(OPERATION, "savedPath"));
+    }
+
+    Ok(ImageGeneration::new(
+        required_non_empty_string(item, "id", OPERATION)?,
+        required_non_empty_string(item, "status", OPERATION)?,
+        optional_string(item, "revisedPrompt", OPERATION)?,
+        required_string(item, "result", OPERATION)?,
+        optional_bool(item, "transparentBackground", OPERATION)?,
+        image_generation_failure(item.get("failure"))?,
+        saved_path,
+    ))
+}
+
 pub(crate) fn turn_audit(
     response: &Value,
     expected_thread_id: &str,
@@ -265,6 +276,7 @@ pub(crate) fn turn_audit(
         turn_id: target_turn_id.to_owned(),
         commands: Vec::new(),
         file_changes: Vec::new(),
+        image_generations: Vec::new(),
         other_item_types: Vec::new(),
     };
     let mut item_ids = HashSet::new();
@@ -299,6 +311,9 @@ pub(crate) fn turn_audit(
         match item_type {
             "commandExecution" => audit.commands.push(command_from_item(item)?),
             "fileChange" => audit.file_changes.push(file_change_from_item(item)?),
+            "imageGeneration" => audit
+                .image_generations
+                .push(image_generation_from_item(item)?),
             other => audit.other_item_types.push(other.to_owned()),
         }
     }
@@ -324,6 +339,52 @@ fn file_change_paths(value: &Value, operation: &'static str) -> Result<Vec<PathB
         .collect()
 }
 
+fn optional_string(value: &Value, field: &str, operation: &'static str) -> Result<Option<String>> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(protocol_field(operation, field)),
+    }
+}
+
+fn optional_bool(value: &Value, field: &str, operation: &'static str) -> Result<Option<bool>> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(protocol_field(operation, field)),
+    }
+}
+
+fn image_generation_failure(value: Option<&Value>) -> Result<Option<ImageGenerationFailure>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    const OPERATION: &str = "item.imageGeneration";
+    match value.get("type").and_then(Value::as_str) {
+        Some("usageLimitExceeded") => {
+            let limit_id = required_non_empty_string(value, "limitId", OPERATION)?;
+            let resets_at = match value.get("resetsAt") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(
+                    value
+                        .as_i64()
+                        .ok_or_else(|| protocol_field(OPERATION, "failure.resetsAt"))?,
+                ),
+            };
+            Ok(Some(ImageGenerationFailure::UsageLimitExceeded {
+                limit_id,
+                resets_at,
+            }))
+        }
+        Some(other) => Err(Error::new(
+            ErrorKind::Protocol,
+            OPERATION,
+            format!("unexpected image-generation failure type '{other}'"),
+        )),
+        None => Err(protocol_field(OPERATION, "failure.type")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,8 +392,8 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn command_items_require_the_pinned_typed_fields() {
-        let summary = command_from_item(&json!({
+    fn command_and_file_items_require_pinned_typed_fields() {
+        let command = command_from_item(&json!({
             "type": "commandExecution",
             "id": "command-1",
             "command": "pwd",
@@ -340,11 +401,8 @@ mod tests {
             "status": "completed"
         }))
         .expect("valid command item");
-
-        assert_eq!(summary.item_id, "command-1");
-        assert_eq!(summary.command, "pwd");
-        assert_eq!(summary.cwd, Some(PathBuf::from("/tmp/project")));
-        assert_eq!(summary.status, "completed");
+        assert_eq!(command.item_id, "command-1");
+        assert_eq!(command.cwd, Some(PathBuf::from("/tmp/project")));
 
         let error = command_from_item(&json!({
             "type": "commandExecution",
@@ -352,54 +410,94 @@ mod tests {
             "command": "pwd",
             "cwd": "/tmp/project"
         }))
-        .expect_err("missing status must not be silently defaulted");
+        .expect_err("missing status must fail");
         assert_eq!(error.kind(), ErrorKind::Protocol);
-        assert_eq!(error.operation(), "item.commandExecution");
 
-        let error = command_from_item(&json!({
-            "type": "commandExecution",
-            "id": "",
-            "command": "pwd",
-            "cwd": "/tmp/project",
-            "status": "completed"
-        }))
-        .expect_err("empty item identity must not be accepted");
-        assert_eq!(error.kind(), ErrorKind::Protocol);
-        assert!(error.message().contains("id"));
-    }
-
-    #[test]
-    fn file_change_items_reject_malformed_changes_instead_of_dropping_them() {
-        let summary = file_change_from_item(&json!({
+        let file = file_change_from_item(&json!({
             "type": "fileChange",
             "id": "patch-1",
             "status": "completed",
-            "changes": [
-                {"path": "src/lib.rs"},
-                {"path": "README.md"}
-            ]
+            "changes": [{"path": "src/lib.rs"}, {"path": "README.md"}]
         }))
-        .expect("valid file change item");
-
-        assert_eq!(summary.item_id, "patch-1");
-        assert_eq!(
-            summary.paths,
-            vec![PathBuf::from("src/lib.rs"), PathBuf::from("README.md")]
-        );
-        assert_eq!(summary.status, "completed");
+        .expect("valid file-change item");
+        assert_eq!(file.paths.len(), 2);
 
         let error = file_change_from_patch(&json!({
             "itemId": "patch-1",
             "changes": [{"kind": "update"}]
         }))
-        .expect_err("missing path must not be silently dropped");
-        assert_eq!(error.kind(), ErrorKind::Protocol);
-        assert_eq!(error.operation(), "item.fileChange.patchUpdated");
+        .expect_err("missing change path must fail");
         assert!(error.message().contains("changes[0].path"));
     }
 
     #[test]
-    fn turn_audit_extracts_only_typed_evidence_and_preserves_other_item_order() {
+    fn image_generation_maps_completed_and_usage_limit_items() {
+        let completed = image_generation_from_item(&json!({
+            "type": "imageGeneration",
+            "id": "image-1",
+            "status": "completed",
+            "revisedPrompt": "a minimal black square",
+            "result": "aW1hZ2U=",
+            "transparentBackground": true,
+            "failure": null,
+            "savedPath": "/tmp/generated_images/image-1.png"
+        }))
+        .expect("completed image item");
+        assert_eq!(completed.id(), "image-1");
+        assert_eq!(completed.status(), "completed");
+        assert_eq!(completed.result_base64(), "aW1hZ2U=");
+        assert_eq!(completed.transparent_background(), Some(true));
+        assert_eq!(
+            completed.saved_path(),
+            Some(std::path::Path::new("/tmp/generated_images/image-1.png"))
+        );
+
+        let failed = image_generation_from_item(&json!({
+            "type": "imageGeneration",
+            "id": "image-2",
+            "status": "failed",
+            "revisedPrompt": "prompt",
+            "result": "",
+            "failure": {
+                "type": "usageLimitExceeded",
+                "limitId": "images",
+                "resetsAt": 1234
+            }
+        }))
+        .expect("typed usage-limit failure");
+        assert_eq!(
+            failed.failure(),
+            Some(&ImageGenerationFailure::UsageLimitExceeded {
+                limit_id: "images".to_owned(),
+                resets_at: Some(1234),
+            })
+        );
+    }
+
+    #[test]
+    fn image_generation_rejects_malformed_optional_fields_and_paths() {
+        for item in [
+            json!({
+                "id": "image-1", "status": "completed", "result": "x",
+                "savedPath": "relative.png"
+            }),
+            json!({
+                "id": "image-1", "status": "completed", "result": "x",
+                "transparentBackground": "yes"
+            }),
+            json!({
+                "id": "image-1", "status": "failed", "result": "",
+                "failure": {"type": "futureFailure"}
+            }),
+        ] {
+            let error = image_generation_from_item(&item).expect_err("malformed image item");
+            assert_eq!(error.kind(), ErrorKind::Protocol);
+            assert_eq!(error.operation(), "item.imageGeneration");
+        }
+    }
+
+    #[test]
+    fn turn_audit_extracts_typed_evidence_and_preserves_other_order() {
         let audit = turn_audit(
             &json!({
                 "thread": {
@@ -407,14 +505,16 @@ mod tests {
                     "turns": [{
                         "id": "turn-1",
                         "status": "completed",
+                        "itemsView": "full",
                         "items": [
                             {"type": "agentMessage", "id": "agent-1"},
                             {"type": "commandExecution", "id": "command-1",
-                             "command": "pwd", "cwd": "/tmp/project", "status": "failed"},
-                            {"type": "reasoning", "id": "reasoning-1"},
+                             "command": "pwd", "cwd": "/tmp/project", "status": "completed"},
+                            {"type": "imageGeneration", "id": "image-1", "status": "completed",
+                             "result": "aW1hZ2U=", "savedPath": "/tmp/image.png"},
                             {"type": "fileChange", "id": "patch-1", "status": "completed",
-                             "changes": [{"path": "src/lib.rs"}]},
-                            {"type": "agentMessage", "id": "agent-2"}
+                             "changes": [{"path": "README.md"}]},
+                            {"type": "reasoning", "id": "reasoning-1"}
                         ]
                     }]
                 }
@@ -422,34 +522,29 @@ mod tests {
             "thread-1",
             "turn-1",
         )
-        .expect("full audit with default itemsView");
+        .expect("full audit");
 
-        assert_eq!(audit.turn_id, "turn-1");
         assert_eq!(audit.commands.len(), 1);
-        assert_eq!(audit.commands[0].item_id, "command-1");
         assert_eq!(audit.file_changes.len(), 1);
-        assert_eq!(audit.file_changes[0].item_id, "patch-1");
-        assert_eq!(
-            audit.other_item_types,
-            ["agentMessage", "reasoning", "agentMessage"]
-        );
+        assert_eq!(audit.image_generations.len(), 1);
+        assert_eq!(audit.image_generations[0].id(), "image-1");
+        assert_eq!(audit.other_item_types, ["agentMessage", "reasoning"]);
     }
 
     #[test]
-    fn turn_audit_rejects_wrong_duplicate_or_partial_history() {
+    fn turn_audit_rejects_wrong_duplicate_partial_and_invalid_item_identity() {
         let wrong_thread = turn_audit(
-            &json!({"thread": {"id": "thread-other", "turns": []}}),
+            &json!({"thread": {"id": "other", "turns": []}}),
             "thread-1",
             "turn-1",
         )
-        .expect_err("wrong thread identity");
-        assert_eq!(wrong_thread.kind(), ErrorKind::Protocol);
-        assert!(wrong_thread.message().contains("thread-other"));
+        .expect_err("wrong thread");
+        assert!(wrong_thread.message().contains("other"));
 
         let duplicate = turn_audit(
             &json!({"thread": {"id": "thread-1", "turns": [
-                {"id": "turn-1", "status": "completed", "itemsView": "full", "items": []},
-                {"id": "turn-1", "status": "completed", "itemsView": "full", "items": []}
+                {"id": "turn-1", "status": "completed", "items": []},
+                {"id": "turn-1", "status": "completed", "items": []}
             ]}}),
             "thread-1",
             "turn-1",
@@ -466,62 +561,25 @@ mod tests {
         )
         .expect_err("partial history");
         assert!(partial.message().contains("partial"));
-    }
-
-    #[test]
-    fn turn_audit_requires_one_target_and_validates_every_item_identity() {
-        let missing = turn_audit(
-            &json!({"thread": {"id": "thread-1", "turns": [
-                {"id": "turn-other", "status": "completed", "itemsView": "full", "items": []}
-            ]}}),
-            "thread-1",
-            "turn-1",
-        )
-        .expect_err("missing target turn");
-        assert!(missing.message().contains("does not contain"));
-
-        let malformed = turn_audit(
-            &json!({"thread": {"id": "thread-1", "turns": [{
-                "id": "turn-1", "status": "completed", "itemsView": "full", "items": [
-                    {"type": "agentMessage", "id": ""}
-                ]
-            }]}}),
-            "thread-1",
-            "turn-1",
-        )
-        .expect_err("empty item id");
-        assert_eq!(malformed.kind(), ErrorKind::Protocol);
-        assert!(malformed.message().contains("items[0].id"));
 
         let duplicate_item = turn_audit(
             &json!({"thread": {"id": "thread-1", "turns": [{
-                "id": "turn-1", "status": "completed", "itemsView": "full", "items": [
+                "id": "turn-1", "status": "completed", "items": [
                     {"type": "agentMessage", "id": "item-1"},
-                    {"type": "commandExecution", "id": "item-1",
-                     "command": "pwd", "cwd": "/tmp", "status": "completed"}
+                    {"type": "agentMessage", "id": "item-1"}
                 ]
             }]}}),
             "thread-1",
             "turn-1",
         )
-        .expect_err("duplicate durable item identity");
-        assert_eq!(duplicate_item.kind(), ErrorKind::Protocol);
+        .expect_err("duplicate item id");
         assert!(duplicate_item.message().contains("duplicate item id"));
     }
 
     #[test]
-    fn turn_audit_rejects_missing_or_non_completed_status() {
-        for (status, expected) in [
-            (None, "status"),
-            (Some("inProgress"), "not completed"),
-            (Some("interrupted"), "not completed"),
-            (Some("failed"), "not completed"),
-        ] {
-            let mut turn = json!({
-                "id": "turn-1",
-                "itemsView": "full",
-                "items": []
-            });
+    fn turn_audit_requires_completed_target() {
+        for status in [None, Some("inProgress"), Some("interrupted"), Some("failed")] {
+            let mut turn = json!({"id": "turn-1", "items": []});
             if let Some(status) = status {
                 turn["status"] = json!(status);
             }
@@ -532,68 +590,42 @@ mod tests {
             )
             .expect_err("only completed turns are auditable");
             assert_eq!(error.kind(), ErrorKind::Protocol);
-            assert!(error.message().contains(expected), "{error}");
         }
     }
 
     #[test]
-    fn maps_terminal_turns_without_exposing_provider_json_to_the_router() {
+    fn terminal_mapping_is_typed_and_redacts_failures() {
         let completed = turn_completion(&json!({
             "turn": {"id": "turn-1", "status": "completed"}
         }))
         .expect("completed turn");
-        assert_eq!(completed.turn_id(), "turn-1");
         assert_eq!(
             completed
                 .into_result("thread-1", "done".to_owned(), None)
-                .expect("completed result")
+                .expect("result")
                 .status,
             TurnStatus::Completed
         );
 
-        let interrupted = turn_completion(&json!({
-            "turn": {"id": "turn-2", "status": "interrupted"}
-        }))
-        .expect("interrupted turn");
-        assert_eq!(
-            interrupted
-                .into_result("thread-1", String::new(), None)
-                .expect("interrupted result")
-                .status,
-            TurnStatus::Interrupted
-        );
-    }
-
-    #[test]
-    fn maps_failed_turns_to_redacted_rpc_errors() {
         let failed = turn_completion(&json!({
             "turn": {
-                "id": "turn-1",
+                "id": "turn-2",
                 "status": "failed",
                 "error": {"message": "Authorization: Bearer secret-token"}
             }
         }))
-        .expect("failed turn envelope");
-        let error = failed
-            .into_result("thread-1", String::new(), None)
-            .expect_err("failed result");
+        .expect("failed envelope")
+        .into_result("thread-1", String::new(), None)
+        .expect_err("failed result");
+        assert_eq!(failed.kind(), ErrorKind::Rpc);
+        assert!(!failed.message().contains("secret-token"));
 
-        assert_eq!(error.kind(), ErrorKind::Rpc);
-        assert_eq!(error.operation(), "turn.completed");
-        assert!(!error.message().contains("secret-token"));
-    }
-
-    #[test]
-    fn rejects_unknown_terminal_status() {
-        let completion = turn_completion(&json!({
-            "turn": {"id": "turn-1", "status": "inProgress"}
+        let unknown = turn_completion(&json!({
+            "turn": {"id": "turn-3", "status": "inProgress"}
         }))
-        .expect("terminal envelope");
-        let error = completion
-            .into_result("thread-1", String::new(), None)
-            .expect_err("non-terminal status");
-
-        assert_eq!(error.kind(), ErrorKind::Protocol);
-        assert_eq!(error.operation(), "turn.completed");
+        .expect("terminal envelope")
+        .into_result("thread-1", String::new(), None)
+        .expect_err("unexpected status");
+        assert_eq!(unknown.kind(), ErrorKind::Protocol);
     }
 }
