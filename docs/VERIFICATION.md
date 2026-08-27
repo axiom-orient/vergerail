@@ -106,14 +106,23 @@ E2E는 sandbox 검증용 임시 root와 생성 래스터용 임시 directory만 
   IFSC signed-out test 1개 통과
 - managed runtime download/install/reuse ignored test 1개 통과
 - isolated local path consumer의 최초 `cargo check`와 후속 `cargo check --locked` 통과
-- dedicated managed home에서 로그아웃 후 exact official package와
-  `gpt-5.6-luna`로 image-only login/E2E를 정확히 한 번 시도했습니다.
-  브라우저 OAuth URL이 발행됐지만 사용자 승인이 deadline 안에 완료되지 않아
-  `account.login.wait`가 600000ms timeout으로 종료됐습니다. 따라서
-  `VERGERAIL_IMAGE_ONLY_OK`, `VERGERAIL_IMAGE_E2E_OK`와
-  `VERGERAIL_LIVE_E2E_FULL_OK`는 증명되지 않았습니다. wrapper/E2E/app-server는
-  기록된 custody 범위에서 종료·reap되었고 즉시 및 +5초 no-survivor와 stdio
-  pipe closure를 확인했습니다.
+- dedicated managed home `prompt-contract/codex-home`에서 exact official
+  package와 `gpt-5.6-luna`로 image-only E2E를 한 번 실행했습니다. `turn/start`
+  request assertion은 image session의 exact `effort=low`를 확인했고, 실제
+  결과는 `1254x1254`, `foregroundPixels=1572516`, PerfectPixel 수정본은
+  `512x512`, `modifiedForegroundPixels=262144`였습니다. marker는
+  `VERGERAIL_IMAGE_E2E_OK ... reasoning=low`
+  및 `VERGERAIL_IMAGE_ONLY_OK model=gpt-5.6-luna owner=prompt-contract reasoning=low`입니다.
+- 같은 clean candidate에서 `scripts/release-verify.sh`를 한 번 실행해
+  scripts/verify, official runtime 2개, IFSC signed-out 1개, managed
+  download/reuse 1개, full authenticated E2E와 final `cargo package --offline
+  --locked`를 모두 exit `0`으로 통과했습니다. full E2E marker는
+  `VERGERAIL_IMAGE_E2E_OK ... reasoning=low`
+  및 `VERGERAIL_LIVE_E2E_FULL_OK model=gpt-5.6-luna owner=prompt-contract`입니다.
+- image-only와 full E2E의 wrapper, guardian, official Codex와 PerfectPixel
+  프로세스는 각각 immediate 및 +5초 scan에서 survivor `0`건이었고 stdio
+  pipe cleanup도 완료됐습니다. 기존 `/Applications/ChatGPT.app` host는
+  user-owned process로서 조사만 하고 건드리지 않았습니다.
 - package 검증에는 protocol provenance, target-neutral guardian stub와
   third-party notice가 포함되고 credential, `target`, runtime binary는
   제외됨
@@ -130,11 +139,10 @@ E2E는 sandbox 검증용 임시 root와 생성 래스터용 임시 directory만 
   정상 argv 실행을 확인했습니다. normal/CFLAGS/CPPFLAGS/CC(extra args) 4개
   isolated build가 모두 같은 bytes/SHA를 냈고, production helper의 legacy
   문자열·심볼은 모두 부재했습니다.
-- non-authenticated candidate gate는 완료됐지만 authenticated image/full E2E가
-  사용자 OAuth 승인을 기다리다 timeout되어 release 전체 판정은 `NEEDS_USER` /
-  `NO-GO`입니다. 사용자가 승인한 뒤에는 같은 전용 home과 같은 package로
-  새로 발행된 단일 live run의 결과를 별도 receipt에 기록해야 하며, 그 전에는
-  push·remote branch 삭제·배포를 수행하지 않습니다.
+- non-authenticated candidate gate와 authenticated image/full E2E 및 release
+  verification은 모두 완료됐습니다. 이 문서는 remote push나 branch 삭제를
+  승인하지 않으며, 최종 배포 전 independent review와 full-SHA consumer 검증이
+  남아 있습니다.
 
 이 증거는 receipt 수집 시점의 local source, 공개 GitHub source와 고정 runtime
 실사용을 지지합니다. crates.io package 배포 증거는 아니며, 각 release commit의
