@@ -99,7 +99,7 @@ E2E는 sandbox 검증용 임시 root와 생성 래스터용 임시 directory만 
   이미지 lifecycle, bounded retained output, warning/unknown-event 관찰을
   확인했습니다. provider 전용 binary·계약은 이번 최소 후보에서 제외합니다.
 - `scripts/verify.sh` exit 0. offline locked all-targets test는 library
-  160개, IFSC binary 5개, IFSC protocol 5개, live harness unit 22개를 모두
+  161개, IFSC binary 5개, IFSC protocol 5개, live harness unit 22개를 모두
   통과했고, doctest·Clippy·rustdoc·cargo-deny·offline package 검사도
   통과했습니다.
 - exact official 0.150.1 package를 사용한 official runtime ignored test 2개와
