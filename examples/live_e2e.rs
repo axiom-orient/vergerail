@@ -1173,6 +1173,7 @@ mod tests {
                     status: "failed".to_owned(),
                 }],
                 file_changes: Vec::new(),
+                image_generations: Vec::new(),
                 other_item_types: vec![
                     "userMessage".to_owned(),
                     "reasoning".to_owned(),
@@ -1193,6 +1194,7 @@ mod tests {
                 turn_id: "turn-1".to_owned(),
                 commands: Vec::new(),
                 file_changes: Vec::new(),
+                image_generations: Vec::new(),
                 other_item_types: vec!["mcpToolCall".to_owned()],
             },
         );
@@ -1214,6 +1216,7 @@ mod tests {
                     paths: vec![path],
                     status: "completed".to_owned(),
                 }],
+                image_generations: Vec::new(),
                 other_item_types: vec!["agentMessage".to_owned()],
             },
         );

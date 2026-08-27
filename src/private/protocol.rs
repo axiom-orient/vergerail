@@ -578,7 +578,12 @@ mod tests {
 
     #[test]
     fn turn_audit_requires_completed_target() {
-        for status in [None, Some("inProgress"), Some("interrupted"), Some("failed")] {
+        for status in [
+            None,
+            Some("inProgress"),
+            Some("interrupted"),
+            Some("failed"),
+        ] {
             let mut turn = json!({"id": "turn-1", "items": []});
             if let Some(status) = status {
                 turn["status"] = json!(status);

@@ -19,8 +19,11 @@ mod session;
 
 pub use account::{Account, Login, LoginMethod};
 pub use approval::{
-    ApprovalDecision, ApprovalEvent, CommandApproval, FileChangeApproval, PermissionApproval,
-    PermissionGrant, PermissionRequest, UserInputAnswer, UserInputQuestion, UserInputRequest,
+    ApprovalEvent, CommandAction, CommandApproval, CommandDecision, FileChangeApproval,
+    FileChangeDecision, FileSystemAccess, FileSystemPermission, FileSystemPermissionPath,
+    FileSystemSpecialPath, NetworkApprovalContext, NetworkPolicyAction, NetworkPolicyAmendment,
+    NetworkProtocol, PermissionApproval, PermissionGrant, UserInputAnswer, UserInputOption,
+    UserInputQuestion, UserInputRequest,
 };
 pub use client::Codex;
 pub use config::CodexConfig;
