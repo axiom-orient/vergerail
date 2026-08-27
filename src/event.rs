@@ -2,6 +2,7 @@
 
 use crate::approval::ApprovalEvent;
 use crate::error::{Error, ErrorKind, Result};
+use crate::image::ImageGeneration;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -142,7 +143,7 @@ pub struct FileChangeSummary {
     pub status: String,
 }
 
-/// Persisted command and file-change evidence for one exact turn.
+/// Persisted typed evidence for one exact completed turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TurnAudit {
     /// Codex turn identifier requested by the caller.
@@ -151,7 +152,9 @@ pub struct TurnAudit {
     pub commands: Vec<CommandSummary>,
     /// Persisted file-change items in provider order.
     pub file_changes: Vec<FileChangeSummary>,
-    /// Types of all other persisted items, preserving occurrence and order.
+    /// Persisted image-generation items in provider order.
+    pub image_generations: Vec<ImageGeneration>,
+    /// Types of all remaining persisted items, preserving occurrence and order.
     pub other_item_types: Vec<String>,
 }
 
@@ -231,6 +234,8 @@ pub enum Event {
     CommandOutput(String),
     /// A file-change item started or changed state.
     FileChange(FileChangeSummary),
+    /// An image-generation item started or changed state.
+    ImageGeneration(ImageGeneration),
     /// Codex requires an explicit caller decision or answer.
     ApprovalRequested(ApprovalEvent),
     /// Updated usage information.
