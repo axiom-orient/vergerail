@@ -68,13 +68,15 @@ cargo run --locked --example live_e2e
 - workspace-write와 root confinement
 - live event와 completed full durable audit 일치
 - 실제 image-generation 결과와 durable image item 일치
+- image-generation `turn/start`에 `effort=low`를 전송하고 나머지 live turn의 기본 effort와 분리됨
 - 생성된 PNG/JPEG/WebP가 `perfectpixel inspect`에서 디코딩되고 non-empty raster로 판정됨
 - 생성 래스터를 `perfectpixel convert`의 Lanczos3 filter로 512×512 PNG로 변환하고 수정본도 다시 inspect함
 
 성공 표식:
 
 ```text
-VERGERAIL_IMAGE_E2E_OK id=<image-item-id> width=<width> height=<height> foregroundPixels=<count> modifiedWidth=512 modifiedHeight=512 modifiedForegroundPixels=<count>
+VERGERAIL_IMAGE_E2E_OK id=<image-item-id> width=<width> height=<height> foregroundPixels=<count> modifiedWidth=512 modifiedHeight=512 modifiedForegroundPixels=<count> reasoning=low
+VERGERAIL_IMAGE_ONLY_OK model=<selected-model> owner=<consumer-owner> reasoning=low
 VERGERAIL_LIVE_E2E_FULL_OK model=<selected-model> owner=<consumer-owner>
 ```
 

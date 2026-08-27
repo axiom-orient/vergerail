@@ -37,6 +37,8 @@ Vergerail은 이 값을 공개 raw JSON이나 낙관적 기본값으로 노출�
 
 `SessionOptions`의 base/developer instruction은 `thread/start`와 `thread/resume`의 `baseInstructions`, `developerInstructions`에 각각 전달합니다. `text_only()`는 같은 요청의 thread-local `config`에서 shell, web search, app, plugin, memory, hook, goal, multi-agent와 관련 external execution surface를 끄고 history persistence를 사용하지 않습니다. 이 config는 session 경계이며 provider 선택이나 workspace authority를 소유하지 않습니다. 이미지 생성은 `CodexConfig::with_image_generation(true)`로 전용 managed home에 명시적으로 opt-in하며 기본값은 false입니다. 각 session은 provider turn deadline과 누적 retained-output byte 상한을 소유합니다. retained output은 assistant text와 item ID별 최신 image-generation metadata/base64의 합계입니다. 기본값은 30분과 8 MiB이며 출력 상한은 1..=64 MiB만 허용합니다.
 
+`ReasoningEffort::Low`는 고정 schema의 `turn/start.params.effort = "low"`로 인코딩합니다. image-generation E2E만 이 값을 명시적으로 선택하고, 다른 session은 기존 기본값 `medium`을 유지합니다.
+
 ## 해석하는 알림
 
 - `turn/started`, `turn/completed`

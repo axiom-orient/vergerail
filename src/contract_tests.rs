@@ -5,7 +5,7 @@
 use crate::runtime::{RuntimeArtifact, RuntimeLock, RuntimePackage};
 use crate::{
     Account, ApprovalEvent, Codex, CodexConfig, CommandDecision, Event, LoginMethod,
-    SessionOptions, TurnStatus,
+    ReasoningEffort, SessionOptions, TurnStatus,
 };
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
@@ -584,6 +584,37 @@ async fn complete_contract_uses_real_process_and_bidirectional_rpc() {
             .any(|item| item.message == "unsupported reverse request rejected")
     );
     codex.logout().await.expect("logout");
+    codex.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_generation_session_sends_low_reasoning_effort() {
+    let package_directory = tempfile::tempdir().expect("package tempdir");
+    let home_directory = tempfile::tempdir().expect("home tempdir");
+    let project_directory = tempfile::tempdir().expect("project tempdir");
+    let low_effort_script = SCRIPT.replace(
+        "assert message[\"params\"][\"effort\"] == \"medium\"",
+        "assert message[\"params\"][\"effort\"] == \"low\"",
+    );
+    assert_ne!(
+        low_effort_script, SCRIPT,
+        "the low-effort contract must be active"
+    );
+    let package = create_fake_package(package_directory.path(), &low_effort_script);
+    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+        .await
+        .expect("connect");
+
+    let result = codex
+        .run(
+            "Generate exactly one image.",
+            SessionOptions::read_only(project_directory.path())
+                .with_model("gpt-5.6-luna")
+                .with_reasoning(ReasoningEffort::Low),
+        )
+        .await
+        .expect("image-generation run");
+    assert_eq!(result.status, TurnStatus::Completed);
     codex.shutdown().await.expect("shutdown");
 }
 

@@ -17,7 +17,8 @@ use tempfile::tempdir;
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use vergerail::{
     Account, ApprovalEvent, Codex, CodexConfig, CommandDecision, Event, FileChangeDecision,
-    LoginMethod, RuntimePackage, RuntimeResolver, SessionOptions, TurnAudit, TurnStatus,
+    LoginMethod, ReasoningEffort, RuntimePackage, RuntimeResolver, SessionOptions, TurnAudit,
+    TurnStatus,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn StdError>>;
@@ -58,7 +59,7 @@ async fn main() -> Result<()> {
     match (verification, shutdown) {
         (Ok(model), Ok(())) => {
             if image_only {
-                println!("VERGERAIL_IMAGE_ONLY_OK model={model} owner={home_owner}");
+                println!("VERGERAIL_IMAGE_ONLY_OK model={model} owner={home_owner} reasoning=low");
             } else {
                 println!("VERGERAIL_LIVE_E2E_FULL_OK model={model} owner={home_owner}");
             }
@@ -190,6 +191,7 @@ async fn verify_image_generation(
         .session(
             SessionOptions::read_only(workspace)
                 .with_model(model)
+                .with_reasoning(ReasoningEffort::Low)
                 .with_maximum_output_bytes(32 * 1024 * 1024)
                 .with_developer_instructions(
                     "Use the image-generation tool exactly once. Do not use shell, file, web, app, plugin, browser, computer-use, or subagent tools.",
@@ -383,7 +385,7 @@ async fn verify_image_generation(
             Ok(()),
         ) => {
             println!(
-                "VERGERAIL_IMAGE_E2E_OK id={id} width={width} height={height} foregroundPixels={foreground} modifiedWidth={modified_width} modifiedHeight={modified_height} modifiedForegroundPixels={modified_foreground}"
+                "VERGERAIL_IMAGE_E2E_OK id={id} width={width} height={height} foregroundPixels={foreground} modifiedWidth={modified_width} modifiedHeight={modified_height} modifiedForegroundPixels={modified_foreground} reasoning=low"
             );
             Ok(())
         }
