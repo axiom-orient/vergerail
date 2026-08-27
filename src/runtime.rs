@@ -26,7 +26,7 @@ pub(crate) use lock::{PinnedRuntime, PinnedRuntimeDownload, RuntimeArtifact, Run
 pub use manager::{DownloadPolicy, ResolvedRuntime, RuntimeOrigin, RuntimeResolver};
 
 const PINNED_SCHEMA: &[u8] =
-    include_bytes!("../protocol/codex-0.149.1/codex_app_server_protocol.v2.schemas.json");
+    include_bytes!("../protocol/codex-0.150.1/codex_app_server_protocol.v2.schemas.json");
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const VERSION_OUTPUT_LIMIT: usize = 8 * 1024;
 const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -466,11 +466,11 @@ async fn verify_version_with_timeout(
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {
         let _ = (entrypoint, version, version_timeout);
-        return Err(Error::new(
+        Err(Error::new(
             ErrorKind::RuntimeVerification,
             "runtime.version",
             "the guardian runtime is supported only on aarch64 macOS",
-        ));
+        ))
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -890,6 +890,7 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
     const TEST_SCRIPT: &str = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-cli 0.test'; exit 0; fi\nexit 0\n";
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     const HANG_SCRIPT: &str = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then sleep 5; fi\n";
 
     #[test]
@@ -898,7 +899,7 @@ mod tests {
         let lock = pinned.lock();
         let schema_hash = canonical_json_sha256(PINNED_SCHEMA).expect("canonical schema hash");
 
-        assert_eq!(lock.version(), "0.149.1");
+        assert_eq!(lock.version(), "0.150.1");
         assert_eq!(schema_hash, lock.protocol_schema_canonical_sha256());
     }
 
@@ -1085,6 +1086,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[tokio::test]
     async fn version_timeout_terminates_hanging_process() {
         let directory = tempfile::tempdir().expect("tempdir");

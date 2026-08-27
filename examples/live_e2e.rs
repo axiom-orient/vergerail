@@ -1,5 +1,7 @@
 //! Human-controlled live ChatGPT account verification.
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use std::env;
 use std::error::Error as StdError;
 use std::fs;
@@ -25,6 +27,8 @@ async fn main() -> Result<()> {
     let home_owner = required_string("VERGERAIL_HOME_OWNER")?;
     let required_model = required_string("VERGERAIL_MODEL")?;
     let workspace = required_path("VERGERAIL_WORKSPACE")?;
+    let perfectpixel = required_path("VERGERAIL_PERFECTPIXEL_BIN")?;
+    let image_only = env::var_os("VERGERAIL_IMAGE_ONLY").is_some_and(|value| value == "1");
     let verification_root = tempdir()?;
     let verification_workspace_alias = verification_root.path().join("workspace");
     fs::create_dir(&verification_workspace_alias)?;
@@ -33,16 +37,30 @@ async fn main() -> Result<()> {
         Some(package_root) => host_runtime(PathBuf::from(package_root))?,
         None => RuntimeResolver::new().resolve().await?.into_package(),
     };
-    let codex =
-        Codex::connect(CodexConfig::new(runtime, codex_home).with_home_owner(home_owner.clone()))
-            .await?;
+    let codex = Codex::connect(
+        CodexConfig::new(runtime, codex_home)
+            .with_home_owner(home_owner.clone())
+            .with_image_generation(true),
+    )
+    .await?;
 
-    let verification =
-        verify_live_account(&codex, &workspace, &verification_workspace, &required_model).await;
+    let verification = verify_live_account(
+        &codex,
+        &workspace,
+        &verification_workspace,
+        &required_model,
+        &perfectpixel,
+        image_only,
+    )
+    .await;
     let shutdown = codex.shutdown().await;
     match (verification, shutdown) {
         (Ok(model), Ok(())) => {
-            println!("VERGERAIL_LIVE_E2E_FULL_OK model={model} owner={home_owner}");
+            if image_only {
+                println!("VERGERAIL_IMAGE_ONLY_OK model={model} owner={home_owner}");
+            } else {
+                println!("VERGERAIL_LIVE_E2E_FULL_OK model={model} owner={home_owner}");
+            }
             Ok(())
         }
         (Err(error), Ok(())) => Err(error),
@@ -58,6 +76,8 @@ async fn verify_live_account(
     workspace: &Path,
     verification_workspace: &Path,
     required_model: &str,
+    perfectpixel: &Path,
+    image_only: bool,
 ) -> Result<String> {
     let account = match codex.account().await? {
         account @ Account::ChatGpt { .. } => account,
@@ -86,6 +106,12 @@ async fn verify_live_account(
         .model()
         .to_owned();
 
+    if image_only {
+        verify_image_generation(codex, verification_workspace, &model, perfectpixel).await?;
+        require_no_diagnostics(codex, "after image verification").await?;
+        return Ok(model);
+    }
+
     let one_shot = codex
         .run(
             "Reply with exactly VERGERAIL_LIVE_ONE_SHOT_OK.",
@@ -99,13 +125,15 @@ async fn verify_live_account(
         .session(SessionOptions::read_only(workspace).with_model(&model))
         .await?;
     let thread_id = session.id().to_owned();
-    let first_turn = session
-        .start(format!(
-            "Remember the token `{resume_nonce}` for the next turn. Reply with exactly VERGERAIL_LIVE_SESSION_OK."
-        ))
-        .await?
-        .wait()
-        .await?;
+    let first_turn = wait_with_live_diagnostics(
+        session
+            .start(format!(
+                "Remember the token `{resume_nonce}` for the next turn. Reply with exactly VERGERAIL_LIVE_SESSION_OK."
+            ))
+            .await?,
+        "session",
+    )
+    .await?;
     require_exact_token(&first_turn, "VERGERAIL_LIVE_SESSION_OK")?;
     session.close().await?;
 
@@ -115,11 +143,15 @@ async fn verify_live_account(
             SessionOptions::read_only(workspace).with_model(&model),
         )
         .await?;
-    let resumed_turn = resumed
-        .start("Reply with exactly the token I asked you to remember in the previous turn, and nothing else.")
-        .await?
-        .wait()
-        .await?;
+    let resumed_turn = wait_with_live_diagnostics(
+        resumed
+            .start(
+                "Reply with exactly the token I asked you to remember in the previous turn, and nothing else.",
+            )
+            .await?,
+        "resumed-session",
+    )
+    .await?;
     require_exact_token(&resumed_turn, &resume_nonce)?;
     resumed.close().await?;
 
@@ -128,8 +160,319 @@ async fn verify_live_account(
     require_no_diagnostics(codex, "before sandbox verification").await?;
     verify_read_only_denials(codex, verification_workspace, &model).await?;
     verify_workspace_write_and_root_confinement(codex, verification_workspace, &model).await?;
+    verify_image_generation(codex, verification_workspace, &model, perfectpixel).await?;
     require_no_diagnostics(codex, "after sandbox verification").await?;
     Ok(model)
+}
+
+async fn verify_image_generation(
+    codex: &Codex,
+    workspace: &Path,
+    model: &str,
+    perfectpixel: &Path,
+) -> Result<()> {
+    let perfectpixel = fs::canonicalize(perfectpixel).map_err(|error| {
+        io::Error::other(format!(
+            "cannot canonicalize VERGERAIL_PERFECTPIXEL_BIN {}: {error}",
+            perfectpixel.display()
+        ))
+    })?;
+    if !fs::metadata(&perfectpixel)?.is_file() {
+        return Err(io::Error::other(format!(
+            "VERGERAIL_PERFECTPIXEL_BIN is not a regular file: {}",
+            perfectpixel.display()
+        ))
+        .into());
+    }
+
+    let session = codex
+        .session(
+            SessionOptions::read_only(workspace)
+                .with_model(model)
+                .with_maximum_output_bytes(32 * 1024 * 1024)
+                .with_developer_instructions(
+                    "Use the image-generation tool exactly once. Do not use shell, file, web, app, plugin, browser, computer-use, or subagent tools.",
+                ),
+        )
+        .await?;
+    let verification: Result<(String, u64, u64, u64, u64, u64, u64)> = async {
+        let mut run = session
+            .start(
+                "Generate exactly one square PNG image: a centered bright green circle on a solid dark navy background. Do not write files or call any tool other than image generation.",
+            )
+            .await?;
+        let mut completed = None;
+        while let Some(event) = run.next_event().await {
+            match event? {
+                Event::Warning(message) => {
+                    report_live_warning("image", "provider-warning", &message)
+                }
+                Event::Unknown(event) => {
+                    report_live_warning("image", "unknown-event", &event.method)
+                }
+                Event::ApprovalRequested(request) => {
+                    report_live_warning("image", "unexpected-approval", "denied");
+                    request.deny().await?;
+                }
+                Event::Completed(result) => {
+                    completed = Some(result);
+                    break;
+                }
+                Event::Failed(error) => return Err(error.into()),
+                _ => {}
+            }
+        }
+        let result = completed
+            .ok_or_else(|| io::Error::other("image run ended without a terminal result"))?;
+        if result.status != TurnStatus::Completed {
+            return Err(io::Error::other(format!(
+                "image turn did not complete: status={:?}",
+                result.status
+            ))
+            .into());
+        }
+
+        let audit = session.audit_turn(&result.turn_id).await?;
+        if !audit.commands.is_empty()
+            || !audit.file_changes.is_empty()
+            || audit.image_generations.as_slice() != result.image_generations.as_slice()
+            || audit
+                .other_item_types
+                .iter()
+                .any(|item_type| !is_passive_item_type(item_type))
+        {
+            return Err(io::Error::other(format!(
+                "live image and durable audit disagreed or recorded an unexpected effect: live={:?} audit={audit:?}",
+                result.image_generations
+            ))
+            .into());
+        }
+
+        let mut selected_image = None;
+        for (index, image) in result.image_generations.iter().enumerate() {
+            if image.status() != "completed"
+                || image.failure().is_some()
+                || image.result_base64().is_empty()
+            {
+                report_image_warning("failed-or-incomplete", image);
+                continue;
+            }
+            let bytes = match BASE64_STANDARD.decode(image.result_base64()) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    report_live_warning(
+                        "image",
+                        "invalid-completed-image",
+                        &format!("id={} base64={error}", image.id()),
+                    );
+                    continue;
+                }
+            };
+            if raster_extension(&bytes).is_none() {
+                report_live_warning(
+                    "image",
+                    "unsupported-completed-image",
+                    &format!("id={} format=unknown", image.id()),
+                );
+                continue;
+            }
+            if selected_image.is_some() {
+                report_image_warning("extra-completed", image);
+            } else {
+                selected_image = Some((index, bytes));
+            }
+        }
+        let (selected_index, bytes) = selected_image.ok_or_else(|| {
+            io::Error::other("image turn did not retain a valid completed raster image")
+        })?;
+        let live_image = &result.image_generations[selected_index];
+        let extension = raster_extension(&bytes).ok_or_else(|| {
+            io::Error::other("generated image is not a supported PNG, JPEG, or WebP raster")
+        })?;
+        let directory = tempdir()?;
+        let image_path = directory.path().join(format!("generated.{extension}"));
+        fs::write(&image_path, &bytes)?;
+
+        let (width, height, foreground) =
+            inspect_raster_with_perfectpixel(&perfectpixel, &image_path, "generated image").await?;
+        let modified_path = directory.path().join("perfectpixel-modified.png");
+        let mut converter = tokio::process::Command::new(&perfectpixel);
+        converter
+            .kill_on_drop(true)
+            .env_clear()
+            .env("NO_COLOR", "1")
+            .arg("convert")
+            .arg(&image_path)
+            .arg("--out")
+            .arg(&modified_path)
+            .arg("--width")
+            .arg("512")
+            .arg("--height")
+            .arg("512")
+            .arg("--filter")
+            .arg("lanczos3");
+        let converted = tokio::time::timeout(Duration::from_secs(30), converter.output())
+            .await
+            .map_err(|_| io::Error::other("PerfectPixel conversion exceeded 30 seconds"))??;
+        if !converted.status.success() {
+            return Err(io::Error::other(format!(
+                "PerfectPixel failed to modify generated image: status={} stderr={}",
+                converted.status,
+                String::from_utf8_lossy(&converted.stderr).trim()
+            ))
+            .into());
+        }
+        let conversion: serde_json::Value = serde_json::from_slice(&converted.stdout)?;
+        if conversion.get("schema").and_then(serde_json::Value::as_str)
+            != Some("perfectpixel.asset-transform/1")
+            || conversion.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+            || conversion.get("command").and_then(serde_json::Value::as_str) != Some("convert")
+            || conversion
+                .get("outputWidth")
+                .and_then(serde_json::Value::as_u64)
+                != Some(512)
+            || conversion
+                .get("outputHeight")
+                .and_then(serde_json::Value::as_u64)
+                != Some(512)
+            || conversion.get("format").and_then(serde_json::Value::as_str) != Some("png")
+            || conversion.get("filter").and_then(serde_json::Value::as_str) != Some("lanczos3")
+        {
+            return Err(io::Error::other(format!(
+                "PerfectPixel conversion contract was unexpected: {conversion}"
+            ))
+            .into());
+        }
+        let (modified_width, modified_height, modified_foreground) =
+            inspect_raster_with_perfectpixel(
+                &perfectpixel,
+                &modified_path,
+                "PerfectPixel-modified image",
+            )
+            .await?;
+        if modified_width != 512 || modified_height != 512 {
+            return Err(io::Error::other(format!(
+                "PerfectPixel-modified image had unexpected dimensions {modified_width}x{modified_height}"
+            ))
+            .into());
+        }
+
+        Ok((
+            live_image.id().to_owned(),
+            width,
+            height,
+            foreground,
+            modified_width,
+            modified_height,
+            modified_foreground,
+        ))
+    }
+    .await;
+    let close = session.close().await;
+    match (verification, close) {
+        (
+            Ok((
+                id,
+                width,
+                height,
+                foreground,
+                modified_width,
+                modified_height,
+                modified_foreground,
+            )),
+            Ok(()),
+        ) => {
+            println!(
+                "VERGERAIL_IMAGE_E2E_OK id={id} width={width} height={height} foregroundPixels={foreground} modifiedWidth={modified_width} modifiedHeight={modified_height} modifiedForegroundPixels={modified_foreground}"
+            );
+            Ok(())
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Err(error), Err(close_error)) => Err(io::Error::other(format!(
+            "{error}; image session cleanup also failed: {close_error}"
+        ))
+        .into()),
+    }
+}
+
+async fn wait_with_live_diagnostics(
+    mut run: vergerail::Run,
+    phase: &str,
+) -> Result<vergerail::RunResult> {
+    while let Some(event) = run.next_event().await {
+        match event? {
+            Event::Warning(message) => report_live_warning(phase, "provider-warning", &message),
+            Event::Unknown(event) => report_live_warning(phase, "unknown-event", &event.method),
+            Event::ApprovalRequested(request) => {
+                report_live_warning(phase, "unexpected-approval", "denied");
+                request.deny().await?;
+            }
+            Event::Completed(result) => return Ok(result),
+            Event::Failed(error) => return Err(error.into()),
+            _ => {}
+        }
+    }
+    Err(io::Error::other(format!("{phase} run ended without a terminal result")).into())
+}
+
+async fn inspect_raster_with_perfectpixel(
+    perfectpixel: &Path,
+    image_path: &Path,
+    description: &str,
+) -> Result<(u64, u64, u64)> {
+    let mut inspector = tokio::process::Command::new(perfectpixel);
+    inspector
+        .kill_on_drop(true)
+        .env_clear()
+        .env("NO_COLOR", "1")
+        .arg("inspect")
+        .arg(image_path);
+    let output = tokio::time::timeout(Duration::from_secs(30), inspector.output())
+        .await
+        .map_err(|_| io::Error::other("PerfectPixel inspection exceeded 30 seconds"))??;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "PerfectPixel rejected {description}: status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+        .into());
+    }
+    let inspection: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let ok = inspection.get("ok").and_then(serde_json::Value::as_bool);
+    let width = inspection.get("width").and_then(serde_json::Value::as_u64);
+    let height = inspection.get("height").and_then(serde_json::Value::as_u64);
+    let foreground = inspection
+        .get("foregroundPixels")
+        .and_then(serde_json::Value::as_u64);
+    if ok != Some(true)
+        || width.is_none_or(|value| value == 0)
+        || height.is_none_or(|value| value == 0)
+        || foreground.is_none_or(|value| value == 0)
+    {
+        return Err(io::Error::other(format!(
+            "PerfectPixel inspection was not a non-empty {description}: {inspection}"
+        ))
+        .into());
+    }
+    Ok((
+        width.unwrap_or_default(),
+        height.unwrap_or_default(),
+        foreground.unwrap_or_default(),
+    ))
+}
+
+fn raster_extension(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("jpg")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
 }
 
 async fn verify_text_only_boundary(codex: &Codex, workspace: &Path, model: &str) -> Result<()> {
@@ -206,7 +549,7 @@ async fn verify_interruption(codex: &Codex, workspace: &Path, model: &str) -> Re
         }
     }
     run.interrupt().await?;
-    let result = run.wait().await?;
+    let result = wait_with_live_diagnostics(run, "interrupt").await?;
     if result.status != TurnStatus::Interrupted {
         return Err(
             io::Error::other(format!("interrupted turn ended with {:?}", result.status)).into(),
@@ -400,6 +743,24 @@ struct TurnObservation {
     result_text: String,
 }
 
+fn report_live_warning(phase: &str, kind: &str, detail: &str) {
+    let detail = detail.replace(['\r', '\n'], " ");
+    eprintln!("VERGERAIL_LIVE_E2E_WARNING phase={phase} kind={kind} detail={detail}");
+}
+
+fn report_image_warning(kind: &str, image: &vergerail::ImageGeneration) {
+    report_live_warning(
+        "image",
+        kind,
+        &format!(
+            "id={} status={} failure={:?}",
+            image.id(),
+            image.status(),
+            image.failure()
+        ),
+    );
+}
+
 enum AuditTarget {
     Command(String),
     FileChange(PathBuf),
@@ -580,11 +941,15 @@ async fn run_audited_turn(
             }
             Event::CommandOutput(_) => {}
             Event::Unknown(event) => {
+                report_live_warning("audited", "unknown-event", &event.method);
                 if !is_allowed_audited_unknown_method(&event.method) {
                     observation.record_unexpected(format!("live-unknown:{}", event.method));
                 }
             }
-            Event::Warning(_) => observation.record_unexpected("live-warning".to_owned()),
+            Event::Warning(message) => {
+                report_live_warning("audited", "provider-warning", &message);
+                observation.record_unexpected("live-warning".to_owned());
+            }
             Event::ApprovalRequested(approval) => match approval {
                 ApprovalEvent::Command(request) => {
                     let accepted = observation.record_command_approval(

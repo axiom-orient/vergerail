@@ -83,14 +83,17 @@ impl Default for RuntimeResolver {
             explicit_root: None,
             cache_root: None,
             download_policy: DownloadPolicy::IfMissing,
-            search_system: true,
+            search_system: false,
             additional_system_candidates: Vec::new(),
         }
     }
 }
 
 impl RuntimeResolver {
-    /// Creates a resolver that searches `PATH` for canonical audited packages and downloads if missing.
+    /// Creates a resolver that reuses or installs the Vergerail-managed pinned runtime.
+    ///
+    /// Host `PATH` discovery is disabled by default so a terminal Codex installation
+    /// cannot select the app-server runtime implicitly.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -121,6 +124,9 @@ impl RuntimeResolver {
     }
 
     /// Enables or disables discovery of audited Codex installations on the host.
+    ///
+    /// This is an explicit opt-in; the default resolver uses only Vergerail-managed
+    /// storage and the pinned download.
     #[must_use]
     pub const fn with_system_discovery(mut self, enabled: bool) -> Self {
         self.search_system = enabled;
@@ -141,6 +147,7 @@ impl RuntimeResolver {
     /// Resolves and fully verifies a runtime, installing the pinned package when allowed.
     pub async fn resolve(self) -> Result<ResolvedRuntime> {
         let pinned = PinnedRuntime::load()?;
+        super::verify_host_target(pinned.lock().target())?;
         let runtime_lock = pinned.lock().clone();
 
         if let Some(root) = self.explicit_root {
@@ -699,6 +706,7 @@ mod tests {
     use flate2::Compression;
     use flate2::write::GzEncoder;
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[tokio::test]
     async fn never_policy_reports_missing_runtime_without_network() {
         let cache = tempfile::tempdir().expect("cache");
@@ -712,7 +720,7 @@ mod tests {
         assert_eq!(error.operation(), "runtime.resolve");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[tokio::test]
     async fn resolver_rejects_a_symlink_cache_root_without_changing_its_target() {
         use std::os::unix::fs::symlink;
@@ -745,6 +753,27 @@ mod tests {
         );
     }
 
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[tokio::test]
+    async fn unsupported_host_fails_before_creating_or_inspecting_the_cache() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let cache = directory.path().join("must-not-be-created");
+
+        let error = RuntimeResolver::new()
+            .with_system_discovery(false)
+            .with_cache_root(&cache)
+            .resolve()
+            .await
+            .expect_err("unsupported host must fail before runtime resolution");
+
+        assert_eq!(error.kind(), ErrorKind::RuntimeVerification);
+        assert_eq!(error.operation(), "runtime.target");
+        assert!(
+            !cache.exists(),
+            "unsupported resolution created its cache root"
+        );
+    }
+
     #[test]
     fn loose_system_binary_is_not_a_canonical_package() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -755,6 +784,16 @@ mod tests {
 
         let pinned = PinnedRuntime::load().expect("pinned runtime");
         assert!(package_for_system_candidate(&candidate, pinned.lock()).is_none());
+    }
+
+    #[test]
+    fn default_resolver_does_not_depend_on_a_terminal_codex() {
+        let resolver = RuntimeResolver::new();
+
+        assert!(!resolver.search_system);
+        assert_eq!(resolver.download_policy, DownloadPolicy::IfMissing);
+        assert!(resolver.explicit_root.is_none());
+        assert!(resolver.additional_system_candidates.is_empty());
     }
 
     #[test]
@@ -888,11 +927,11 @@ mod tests {
         let pinned = PinnedRuntime::load().expect("pinned runtime");
         assert_eq!(
             managed_relative_root(pinned.lock()),
-            PathBuf::from("codex/0.149.1/aarch64-apple-darwin")
+            PathBuf::from("codex/0.150.1/aarch64-apple-darwin")
         );
         assert_eq!(
             installation_lock_name(pinned.lock()),
-            ".codex-0.149.1-aarch64-apple-darwin.lock"
+            ".codex-0.150.1-aarch64-apple-darwin.lock"
         );
     }
 

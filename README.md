@@ -4,7 +4,7 @@
 
 Vergerail은 Rust 애플리케이션에서 고정된 OpenAI Codex app-server를 로컬 자식 프로세스로 사용하는 라이브러리입니다. 검증된 runtime을 stdio JSONL로 연결하며, 범용 provider SDK·HTTP client·공개 daemon은 아닙니다. 저장소에는 정적 IFSC `ScreenProgram`을 생성하는 one-shot `ifsc_text_provider` binary도 있습니다.
 
-현재 checkout은 Apple silicon macOS, Codex `0.149.1`, Rust `1.97.1` 이상을 지원합니다. 이 프로젝트는 공개 GitHub source로 배포하며, `publish = false` 설정으로 crates.io에는 게시하지 않습니다. 상세 증거와 배포 조건은 [검증](docs/VERIFICATION.md)과 [배포](docs/RELEASE.md) 문서가 관리합니다.
+현재 checkout의 Codex runtime 연결은 Apple silicon macOS, Codex `0.150.1`, Rust `1.97.1` 이상을 지원합니다. aarch64 Linux에서는 library와 `ifsc_text_provider`를 build·test·install하고 runtime에 접근하지 않는 typed input/error 경로를 실행할 수 있지만, 고정 runtime과 guardian은 macOS 전용이므로 `RuntimeResolver`/`Codex` 실행 지원을 뜻하지 않습니다. 이 프로젝트는 공개 GitHub source로 배포하며, `publish = false` 설정으로 crates.io에는 게시하지 않습니다. 상세 증거와 배포 조건은 [검증](docs/VERIFICATION.md)과 [배포](docs/RELEASE.md) 문서가 관리합니다.
 
 ## 저장소 계약
 
@@ -66,7 +66,7 @@ async fn main() -> vergerail::Result<()> {
 }
 ```
 
-`RuntimeResolver::resolve()`만 고정 archive를 다운로드할 수 있습니다. `Codex::connect()`는 전달받은 package를 재검증하고 실행하지만 설치를 시작하지 않습니다.
+`RuntimeResolver::resolve()`는 기본적으로 터미널의 `codex`나 ChatGPT 앱 번들을 사용하지 않고 VergeRail 관리 cache에서 정확한 고정 runtime을 재사용하거나 공식 archive를 설치합니다. 외부의 완전한 감사 package를 재사용하려는 호출자만 `with_system_discovery(true)`를 명시해야 합니다. `Codex::connect()`는 전달받은 package를 재검증하고 실행하지만 설치를 시작하지 않습니다.
 
 ## 로그인과 실행
 
@@ -91,6 +91,36 @@ URL 열기, 계정 선택, OAuth 승인과 MFA는 host 애플리케이션과 사
 
 session을 마치면 `Session::close()`, client 전체는 `Codex::shutdown()`으로 종료합니다. 완료된 persistent turn의 durable effect는 session을 닫기 전에 `Session::audit_turn()`으로 검사합니다.
 
+## 이미지 생성
+
+이미지 생성은 기본적으로 꺼져 있습니다. 전용 home을 연결할 때 명시적으로 활성화하면 `Event::ImageGeneration`으로 수명주기를 관찰하고, terminal `RunResult::image_generations`에서 item ID별 최신 상태와 base64 결과를 받을 수 있습니다. persistent session의 `TurnAudit::image_generations`와 대조하면 live 결과가 durable history와 일치하는지도 확인할 수 있습니다.
+
+```rust,no_run
+use vergerail::{Codex, CodexConfig, RuntimePackage, SessionOptions};
+
+async fn generate(
+    runtime: RuntimePackage,
+    codex_home: impl Into<std::path::PathBuf>,
+) -> vergerail::Result<()> {
+    let codex = Codex::connect(
+        CodexConfig::new(runtime, codex_home)
+            .with_home_owner("image-app")
+            .with_image_generation(true),
+    )
+    .await?;
+    let result = codex
+        .run(
+            "Generate one square PNG of a green circle on a navy background.",
+            SessionOptions::read_only(".").with_maximum_output_bytes(32 * 1024 * 1024),
+        )
+        .await?;
+    assert_eq!(result.image_generations.len(), 1);
+    codex.shutdown().await
+}
+```
+
+세션의 retained-output 제한은 assistant text와 image item metadata/base64의 합계에 적용됩니다. 실계정 E2E는 생성 bytes를 임시 파일로만 디코딩하고 별도 `perfectpixel inspect` 실행으로 PNG/JPEG/WebP 디코딩, 크기와 foreground 존재를 검증합니다.
+
 ## Text-only adapter
 
 text adapter는 `SessionOptions::read_only(...).text_only()`와 전용 base/developer instruction을 사용해야 합니다. 이 설정은 실행·외부 context surface를 끄지만 sandbox를 대체하지 않으므로 live event와 durable audit을 함께 확인해야 합니다.
@@ -101,7 +131,7 @@ text adapter는 `SessionOptions::read_only(...).text_only()`와 전용 base/deve
 
 - 연결·실행: `Codex`, `CodexConfig`, `Session`, `Run`, `SessionOptions`, `Sandbox`
 - 계정·모델: `Account`, `Login`, `LoginMethod`, `Model`
-- 이벤트·결과: `Event`, `RunResult`, `TurnStatus`, `TurnAudit`, `Usage`, `Diagnostic`
+- 이벤트·결과: `Event`, `RunResult`, `ImageGeneration`, `ImageGenerationFailure`, `TurnStatus`, `TurnAudit`, `Usage`, `Diagnostic`
 - runtime: `RuntimeResolver`, `RuntimePackage`, `ResolvedRuntime`, `RuntimeOrigin`, `DownloadPolicy`
 - 오류: `Error`, `ErrorKind`, `Result`; 비멱등 결과가 불명확하면 `OutcomeUnknown`
 

@@ -1,6 +1,6 @@
 # 배포
 
-Vergerail `0.2.0`은 Codex `0.149.1`과 Apple silicon macOS만 지원합니다. GitHub source와 crates.io 배포는 별도 gate입니다.
+Vergerail `0.2.0`은 Codex `0.150.1`과 Apple silicon macOS만 지원합니다. GitHub source와 crates.io 배포는 별도 gate입니다.
 
 ## 현재 상태
 
@@ -31,7 +31,8 @@ GitHub Actions와 `.github/workflows`는 배포 수단으로 사용하지 않습
 `scripts/release-verify.sh`를 사용해야 합니다. 후자는 먼저 `HEAD`가 존재하고
 working tree와 index가 모두 깨끗한지 확인한 뒤, aarch64 macOS에서
 `VERGERAIL_CODEX_PACKAGE`, 기존 전용 `VERGERAIL_CODEX_HOME`,
-`VERGERAIL_HOME_OWNER`, visible `VERGERAIL_MODEL`, `VERGERAIL_WORKSPACE`를
+`VERGERAIL_HOME_OWNER`, visible `VERGERAIL_MODEL`, `VERGERAIL_WORKSPACE`,
+검증할 `VERGERAIL_PERFECTPIXEL_BIN`을
 요구합니다. 그 환경으로 개발 gate(공식 runtime 2개와 IFSC signed-out 1개),
 managed runtime download/reuse, authenticated live E2E를 직접 실행하고 마지막으로
 `cargo package --offline --locked`를 `--allow-dirty` 없이 실행합니다. credential은

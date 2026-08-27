@@ -1,0 +1,15 @@
+provider = "openai-codex"
+version = "0.150.1"
+tag = "rust-v0.150.1"
+commit = "90854393966b21e9ebfd21b122334eb09a20c93d"
+source_archive = "openai/codex refs/tags/rust-v0.150.1"
+source_archive_url = "https://github.com/openai/codex/archive/refs/tags/rust-v0.150.1.tar.gz"
+source_archive_bytes = 12517575
+source_archive_sha256 = "1b50d9a7b978e27c51e803912429b8d7e0b731ca5bfd710ba5d18e188970dd34"
+source_path = "codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json"
+schema_raw_bytes = 560474
+schema_raw_sha256 = "8cdccfc35582696d7141e7f916e0d5a664ab5b5e90b732f104284d2507f369f8"
+schema_canonical_bytes = 306715
+schema_canonical_sha256 = "a0aac52c9ea4bfcc02a1a323d612fb460e92b35e493695f01e2dd9b6e5072d33"
+canonicalization = "recursive lexical object-key sort; array order preserved; compact UTF-8 JSON"
+format = "JSON Schema draft-07 bundle"

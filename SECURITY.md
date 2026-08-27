@@ -4,9 +4,9 @@ Vergerail이 실행하는 Codex app-server는 파일을 읽고 명령을 실행�
 
 ## 지원 범위
 
-- Codex `0.149.1`
+- Codex `0.150.1`
 - `aarch64-apple-darwin`
-- upstream commit `ff29a44391deccde0aba0f8390337d7f3c319ea4`
+- upstream commit `90854393966b21e9ebfd21b122334eb09a20c93d`
 
 다른 버전과 target은 낙관적으로 실행하지 않고 거부합니다.
 

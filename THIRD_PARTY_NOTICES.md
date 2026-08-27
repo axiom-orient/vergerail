@@ -2,7 +2,7 @@
 
 This repository includes material derived from OpenAI Codex. The pinned source
 schema provenance is recorded in
-[`protocol/codex-0.149.1/PROVENANCE.toml`](protocol/codex-0.149.1/PROVENANCE.toml).
+[`protocol/codex-0.150.1/PROVENANCE.toml`](protocol/codex-0.150.1/PROVENANCE.toml).
 
 The upstream Codex notice states:
 

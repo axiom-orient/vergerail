@@ -11,6 +11,7 @@ pub(crate) use run_state::{
 use crate::client::ClientInner;
 use crate::error::{Error, ErrorKind, Result};
 use crate::event::{Event, RunResult, TurnAudit};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -135,6 +136,8 @@ pub struct SessionOptions {
     base_instructions: Option<String>,
     developer_instructions: Option<String>,
     text_only: bool,
+    image_only: bool,
+    output_schema: Option<Value>,
     turn_timeout: Duration,
     maximum_output_bytes: usize,
 }
@@ -156,6 +159,8 @@ impl SessionOptions {
             base_instructions: None,
             developer_instructions: None,
             text_only: false,
+            image_only: false,
+            output_schema: None,
             turn_timeout: DEFAULT_TURN_TIMEOUT,
             maximum_output_bytes: DEFAULT_MAXIMUM_OUTPUT_BYTES,
         }
@@ -176,6 +181,8 @@ impl SessionOptions {
             base_instructions: None,
             developer_instructions: None,
             text_only: false,
+            image_only: false,
+            output_schema: None,
             turn_timeout: DEFAULT_TURN_TIMEOUT,
             maximum_output_bytes: DEFAULT_MAXIMUM_OUTPUT_BYTES,
         }
@@ -226,6 +233,24 @@ impl SessionOptions {
         self
     }
 
+    /// Restricts the app-server thread to exactly one image-generation
+    /// capability. Filesystem, network, shell, app, memory, plugin, and
+    /// multi-agent surfaces remain disabled.
+    #[must_use]
+    pub const fn image_only(mut self) -> Self {
+        self.image_only = true;
+        self
+    }
+
+    /// Requires the app-server to return a structured JSON object matching the
+    /// supplied output schema. The schema is sent as the native `turn/start`
+    /// outputSchema field; callers must still validate the returned bytes.
+    #[must_use]
+    pub fn with_output_schema(mut self, schema: Value) -> Self {
+        self.output_schema = Some(schema);
+        self
+    }
+
     /// Sets the maximum lifetime of each provider turn in this session.
     #[must_use]
     pub const fn with_turn_timeout(mut self, timeout: Duration) -> Self {
@@ -233,7 +258,8 @@ impl SessionOptions {
         self
     }
 
-    /// Sets the maximum cumulative assistant text retained for each turn.
+    /// Sets the maximum cumulative assistant text and image payload retained
+    /// for each turn.
     #[must_use]
     pub const fn with_maximum_output_bytes(mut self, bytes: usize) -> Self {
         self.maximum_output_bytes = bytes;
@@ -258,6 +284,13 @@ impl SessionOptions {
                 ErrorKind::InvalidInput,
                 "SessionOptions::validate",
                 "working directory must be non-empty",
+            ));
+        }
+        if self.text_only && self.image_only {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "SessionOptions::validate",
+                "text-only and image-only modes are mutually exclusive",
             ));
         }
         if self
@@ -295,6 +328,29 @@ impl SessionOptions {
                 "turn timeout must be greater than zero",
             ));
         }
+        if let Some(schema) = self.output_schema.as_ref() {
+            if !schema.is_object() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "SessionOptions::validate",
+                    "output schema must be a JSON object",
+                ));
+            }
+            let bytes = serde_json::to_vec(schema).map_err(|error| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    "SessionOptions::validate",
+                    format!("output schema is not serializable: {error}"),
+                )
+            })?;
+            if bytes.len() > 64 * 1024 {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "SessionOptions::validate",
+                    "output schema exceeds the 64 KiB bound",
+                ));
+            }
+        }
         if !(1..=MAXIMUM_OUTPUT_BYTES).contains(&self.maximum_output_bytes) {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
@@ -327,6 +383,14 @@ impl SessionOptions {
 
     pub(crate) const fn is_text_only(&self) -> bool {
         self.text_only
+    }
+
+    pub(crate) const fn is_image_only(&self) -> bool {
+        self.image_only
+    }
+
+    pub(crate) fn output_schema(&self) -> Option<Value> {
+        self.output_schema.clone()
     }
 
     pub(crate) const fn turn_timeout(&self) -> Duration {
@@ -389,6 +453,7 @@ pub struct Session {
     ephemeral: bool,
     turn_timeout: Duration,
     maximum_output_bytes: usize,
+    output_schema: Option<Value>,
     active: Arc<AtomicBool>,
     lifecycle: Mutex<SessionLifecycle>,
 }
@@ -415,6 +480,7 @@ impl Session {
             ephemeral: options.is_ephemeral(),
             turn_timeout: options.turn_timeout(),
             maximum_output_bytes: options.maximum_output_bytes(),
+            output_schema: options.output_schema(),
             active: Arc::new(AtomicBool::new(false)),
             lifecycle: Mutex::new(SessionLifecycle::Open),
         }
@@ -518,6 +584,7 @@ impl Session {
                 self.sandbox,
                 self.reasoning,
                 prompt,
+                self.output_schema.clone(),
             )
             .await?;
         registration.disarm();

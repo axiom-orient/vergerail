@@ -3,12 +3,11 @@
 use vergerail::{Account, Codex, CodexConfig, DownloadPolicy, RuntimeOrigin, RuntimeResolver};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "downloads and installs the pinned 0.149.1 macOS runtime"]
+#[ignore = "downloads and installs the pinned 0.150.1 macOS runtime"]
 async fn downloads_connects_and_reuses_the_managed_runtime() {
     let cache = tempfile::tempdir().expect("isolated shared runtime cache");
     let home = tempfile::tempdir().expect("isolated CODEX_HOME");
     let resolved = RuntimeResolver::new()
-        .with_system_discovery(false)
         .with_cache_root(cache.path())
         .resolve()
         .await
@@ -25,7 +24,6 @@ async fn downloads_connects_and_reuses_the_managed_runtime() {
     codex.shutdown().await.expect("clean shutdown");
 
     let reused = RuntimeResolver::new()
-        .with_system_discovery(false)
         .with_cache_root(cache.path())
         .with_download_policy(DownloadPolicy::Never)
         .resolve()

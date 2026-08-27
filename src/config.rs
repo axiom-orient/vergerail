@@ -25,6 +25,7 @@ pub struct CodexConfig {
     pub(crate) outbound_capacity: usize,
     pub(crate) event_capacity: usize,
     pub(crate) stderr_capacity: usize,
+    pub(crate) image_generation: bool,
 }
 
 impl CodexConfig {
@@ -45,6 +46,7 @@ impl CodexConfig {
             outbound_capacity: 128,
             event_capacity: 256,
             stderr_capacity: 64 * 1024,
+            image_generation: false,
         }
     }
 
@@ -62,6 +64,17 @@ impl CodexConfig {
     #[must_use]
     pub fn with_client_title(mut self, title: impl Into<String>) -> Self {
         self.client_title = title.into();
+        self
+    }
+
+    /// Enables Codex image-generation tools in this dedicated managed home.
+    ///
+    /// The capability is disabled by default. Enabling it permits the pinned
+    /// app-server to call its image-generation model; generated image bytes are
+    /// still bounded by each session's maximum retained output limit.
+    #[must_use]
+    pub const fn with_image_generation(mut self, enabled: bool) -> Self {
+        self.image_generation = enabled;
         self
     }
 
