@@ -1,40 +1,40 @@
 {
-  "version": "0.149.1",
-  "upstream_commit": "ff29a44391deccde0aba0f8390337d7f3c319ea4",
+  "version": "0.150.1",
+  "upstream_commit": "90854393966b21e9ebfd21b122334eb09a20c93d",
   "target": "aarch64-apple-darwin",
   "variant": "codex",
   "entrypoint": "bin/codex",
-  "protocol_schema_canonical_sha256": "a09caf2ab07d69a3ef48384b40793d32718efe953134efd28d7276be9282cfe7",
+  "protocol_schema_canonical_sha256": "a0aac52c9ea4bfcc02a1a323d612fb460e92b35e493695f01e2dd9b6e5072d33",
   "download": {
-    "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.149.1-darwin-arm64.tgz",
-    "bytes": 114152335,
-    "sha256": "151f8b96af0529c1267e7438d2cbc6d26213922fa017b96540abaf5f07d792d2",
+    "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.150.1-darwin-arm64.tgz",
+    "bytes": 117535191,
+    "sha256": "e5008a5b8d7a22e2ad2922a74783de8f7202b7b886a181e6ddbec7633609c885",
     "archive_prefix": "package/vendor/aarch64-apple-darwin"
   },
   "artifacts": [
     {
       "path": "bin/codex",
-      "sha256": "f0d8762236594359b60cfbe17f4c7e945a3ce8d1c91e74778838c968d250fb6c",
+      "sha256": "a14f9a907c12c8812878b70e6b7d65f81c39ed795513e46a55817d7428c0ca6b",
       "executable": true
     },
     {
       "path": "bin/codex-code-mode-host",
-      "sha256": "c9340c2cc50c86193cc670aa9130980d6982059a0965aeae41bf4e85952fc43e",
+      "sha256": "b9333d84d974ad34e8263d3f0fd5282e96f6a85a79f76d7456327921a04b5459",
       "executable": true
     },
     {
       "path": "codex-package.json",
-      "sha256": "4876c111223202bc63cd5f0a9d1009b931e06c70a51e3f738204cd66a4d52937",
+      "sha256": "f1fb8f28a73bd100038949292c642b1db871b4753fe21dc8e2aef92d4f792eaf",
       "executable": false
     },
     {
       "path": "codex-path/rg",
-      "sha256": "4298efd414836892c913b2e87401d62fdd7c6ec4026d9bad8e3fab10557e411f",
+      "sha256": "5d24e1af7efa7811e03df5555eeaa984bc8bd98ab42a5d49ecf30f163273e6c7",
       "executable": true
     },
     {
       "path": "codex-resources/zsh/bin/zsh",
-      "sha256": "2d6d9389383520a79caa22469e48419cc1265cc030eaa22a4bedbf80ce94b42a",
+      "sha256": "6eab971b2ef4a2e5e9d86a6fbd779c18f93fa6ae1f2c016b896324255034decf",
       "executable": true
     }
   ]

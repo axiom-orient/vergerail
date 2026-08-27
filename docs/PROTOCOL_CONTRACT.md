@@ -4,28 +4,28 @@
 
 | 항목 | 값 |
 | --- | --- |
-| Codex | `0.149.1` |
-| tag | `rust-v0.149.1` |
-| commit | `ff29a44391deccde0aba0f8390337d7f3c319ea4` |
-| schema SHA-256 | `a09caf2ab07d69a3ef48384b40793d32718efe953134efd28d7276be9282cfe7` |
+| Codex | `0.150.1` |
+| tag | `rust-v0.150.1` |
+| commit | `90854393966b21e9ebfd21b122334eb09a20c93d` |
+| schema SHA-256 | `a0aac52c9ea4bfcc02a1a323d612fb460e92b35e493695f01e2dd9b6e5072d33` |
 | transport | stdio JSONL |
 | experimental API | 사용하지 않음 |
 
 실제 wire field는 main branch 문서가 아니라 저장소에 고정한 schema와 fixture를 기준으로 합니다.
 
-## 0.149.1 호환성 검토
+## 0.150.1 호환성 검토
 
-0.147.0 고정 schema와 공식 `rust-v0.149.1` tag의 schema를 구조적으로 비교했습니다.
+이전 고정 schema와 공식 `rust-v0.150.1` tag의 schema를 구조적으로 비교했습니다.
 Vergerail이 보내거나 해석하는 `initialize`, account login/read/logout, `model/list`,
 thread start/resume/read/unsubscribe, turn start/interrupt와 typed notification의
 method, request/response 참조, 필수 routing field는 변경되지 않았습니다. approval
 reverse request는 기존처럼 앱 서버의 server-request 경계에서 typed parser로 검증합니다.
 
-새 schema에는 기존 계약을 깨지 않는 additive field와 enum이 포함됩니다. 예를 들어
-`Thread.projectId`, `Model.multiAgentVersion`, 일부 `ThreadItem` delivery/failure
-field와 새 오류·plan enum이 추가되었습니다. Vergerail은 이 값을 공개 raw JSON이나
-낙관적 기본값으로 노출하지 않고, 기존에 소유한 필수 field만 계속 fail-closed로
-검증합니다. 따라서 public API adapter나 compatibility shim을 추가하지 않았습니다.
+새 schema에는 Vergerail이 사용하지 않는 additive API와 field가 포함됩니다.
+Vergerail은 이 값을 공개 raw JSON이나 낙관적 기본값으로 노출하지 않고, 기존에
+소유한 routing과 완료 상태는 계속 엄격히 검증합니다. 이미지 생성의 시작 알림은
+공식 runtime이 아직 상태를 확정하지 않은 payload를 보낼 수 있으므로 빈 `status`를
+시작 단계에서만 허용하며, 완료 알림과 durable audit의 상태는 필수로 유지합니다.
 
 ## 보내는 요청
 
@@ -35,7 +35,7 @@ field와 새 오류·plan enum이 추가되었습니다. Vergerail은 이 값을
 - `thread/start`, `thread/resume`, `thread/read`, `thread/unsubscribe`
 - `turn/start`, `turn/interrupt`
 
-`SessionOptions`의 base/developer instruction은 `thread/start`와 `thread/resume`의 `baseInstructions`, `developerInstructions`에 각각 전달합니다. `text_only()`는 같은 요청의 thread-local `config`에서 shell, web search, app, plugin, memory, hook, goal, multi-agent와 관련 external execution surface를 끄고 history persistence를 사용하지 않습니다. 이 config는 session 경계이며 provider 선택이나 workspace authority를 소유하지 않습니다. 각 session은 provider turn deadline과 누적 assistant text byte 상한을 소유합니다. 기본값은 30분과 8 MiB이며 출력 상한은 1..=64 MiB만 허용합니다.
+`SessionOptions`의 base/developer instruction은 `thread/start`와 `thread/resume`의 `baseInstructions`, `developerInstructions`에 각각 전달합니다. `text_only()`는 같은 요청의 thread-local `config`에서 shell, web search, app, plugin, memory, hook, goal, multi-agent와 관련 external execution surface를 끄고 history persistence를 사용하지 않습니다. 이 config는 session 경계이며 provider 선택이나 workspace authority를 소유하지 않습니다. 이미지 생성은 `CodexConfig::with_image_generation(true)`로 전용 managed home에 명시적으로 opt-in하며 기본값은 false입니다. 각 session은 provider turn deadline과 누적 retained-output byte 상한을 소유합니다. retained output은 assistant text와 item ID별 최신 image-generation metadata/base64의 합계입니다. 기본값은 30분과 8 MiB이며 출력 상한은 1..=64 MiB만 허용합니다.
 
 ## 해석하는 알림
 
@@ -56,10 +56,11 @@ Vergerail이 위 목록에서 typed event로 해석하는 알림은 고정 schem
 - command/file item의 필수 `id`, `status`, `cwd`, `changes[].path`를 기본값으로 만들거나 일부만 버리지 않습니다.
 - malformed notification만 버리고 route를 해제하면 실제 runtime turn이 계속 실행될 수 있으므로 session 재사용으로 복구하지 않습니다. 새 연결에서만 재시작합니다.
 - 알 수 없는 additive method나 지원하지 않는 item type은 provider JSON을 공개하지 않고 opaque event 또는 diagnostic으로 축약합니다.
+- `imageGeneration` item은 `Event::ImageGeneration`으로 전달하며 item ID별 최신 lifecycle을 terminal `RunResult::image_generations`에 보존합니다. item 수는 event capacity, text를 포함한 retained bytes는 session output limit로 제한합니다.
 
 ## 완료 turn 감사
 
-실시간 item 알림만으로 실행 증거가 부족할 때 persistent `Session::audit_turn`이 안정 `thread/read`를 한 번 호출합니다. `includeTurns: true` 응답에서 요청한 thread ID와 turn ID가 정확히 일치하고 target status가 `completed`이며 `itemsView`가 생략되었거나(고정 schema의 기본값 `full`) 명시적으로 `full`일 때만 command/file-change를 공개 타입으로 반환합니다. target turn 부재·중복, missing/non-completed status, turn 안의 duplicate item ID, partial view, malformed known item은 실패하며 모델 설명이나 marker 상태로 대체하지 않습니다.
+실시간 item 알림만으로 실행 증거가 부족할 때 persistent `Session::audit_turn`이 안정 `thread/read`를 한 번 호출합니다. `includeTurns: true` 응답에서 요청한 thread ID와 turn ID가 정확히 일치하고 target status가 `completed`이며 `itemsView`가 생략되었거나(고정 schema의 기본값 `full`) 명시적으로 `full`일 때만 command/file-change/image-generation을 공개 타입으로 반환합니다. target turn 부재·중복, missing/non-completed status, turn 안의 duplicate item ID, partial view, malformed known item은 실패하며 모델 설명이나 marker 상태로 대체하지 않습니다.
 
 이 경로는 ephemeral session과 active run에서는 거부됩니다. 긴 thread의 전체 history를 매 terminal마다 다시 읽어 누적 O(n²) I/O를 만들지 않도록 일반 event router가 자동 호출하지 않으며, 감사 증거가 필요한 caller만 명시적으로 사용합니다. 사용자 메시지와 reasoning 원문은 반환하지 않고 non-command/file item의 type만 보존합니다.
 
@@ -94,7 +95,7 @@ text-only는 sandbox의 대체물이 아닙니다. read-only sandbox와 함께 �
 - 기본 frame 제한 16MiB
 - queue에 넣기 전에 encode와 크기 검증
 - `turn/start` 응답 전 알림도 run event capacity 안에서만 보관
-- assistant text는 frame별 크기와 별도로 누적 byte 상한을 적용
+- assistant text와 item ID별 최신 image-generation payload는 frame별 크기와 별도로 합산 누적 byte 상한을 적용
 - 부분 write나 flush 실패 뒤 결과를 알 수 없으면 `OutcomeUnknown`
 - login/thread/turn 생성처럼 원격 상태를 새로 만드는 비멱등 요청은 자동 재시도하지 않음. `thread/unsubscribe`는 pinned schema의 `notLoaded`·`notSubscribed`·`unsubscribed`를 모두 성공으로 취급해 bounded cleanup에서 안전하게 재호출할 수 있음
 - caller cancellation과 timeout은 pending entry 제거와 response handoff 양쪽에서 같은 상태로 판정함. 성공 표식과 pending entry 제거를 하나의 원자적 registry transition으로 공개하며, 요청이 이미 dispatch됐거나 성공 응답이 caller에게 귀속되지 못하면 `OutcomeUnknown`으로 connection을 종료함

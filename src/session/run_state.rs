@@ -2,6 +2,7 @@
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::event::{Event, RunResult, TurnCompletion, Usage};
+use crate::image::ImageGeneration;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -28,6 +29,10 @@ struct RunRoute {
     text: String,
     maximum_output_bytes: usize,
     usage: Option<Usage>,
+    image_generations: Vec<ImageGeneration>,
+    image_generation_bytes: usize,
+    deferred_image_bytes: usize,
+    deferred_image_bytes_by_id: HashMap<String, usize>,
 }
 
 enum RunPhase {
@@ -132,6 +137,70 @@ impl RunRoute {
         }
 
         if defer_while_starting {
+            let deferred_image_id = match &event {
+                Event::ImageGeneration(image) => Some(image.id().to_owned()),
+                _ => None,
+            };
+            let is_deferred_phase = matches!(
+                self.phase,
+                RunPhase::Starting { .. } | RunPhase::Replaying { .. }
+            );
+            if is_deferred_phase {
+                let Some(turn_id) = observed_turn_id else {
+                    drop(event);
+                    return RunEventOutcome::IgnoredBeforeTurn;
+                };
+                if let Event::ImageGeneration(image) = &event {
+                    let Some(image_bytes) = image.retained_bytes() else {
+                        drop(event);
+                        return self.record_failure(
+                            turn_id.to_owned(),
+                            Error::new(
+                                ErrorKind::ResourceLimit,
+                                "run.images",
+                                "pre-acknowledgement image payload overflowed the platform limit",
+                            ),
+                        );
+                    };
+                    let previous_bytes = self
+                        .deferred_image_bytes_by_id
+                        .get(image.id())
+                        .copied()
+                        .unwrap_or(0);
+                    let Some(deferred_bytes) = self
+                        .deferred_image_bytes
+                        .checked_sub(previous_bytes)
+                        .and_then(|bytes| bytes.checked_add(image_bytes))
+                    else {
+                        drop(event);
+                        return self.record_failure(
+                            turn_id.to_owned(),
+                            Error::new(
+                                ErrorKind::ResourceLimit,
+                                "run.images",
+                                "pre-acknowledgement image payload size overflowed the platform limit",
+                            ),
+                        );
+                    };
+                    if deferred_bytes > self.maximum_output_bytes {
+                        drop(event);
+                        return self.record_failure(
+                            turn_id.to_owned(),
+                            Error::new(
+                                ErrorKind::ResourceLimit,
+                                "run.images",
+                                format!(
+                                    "pre-acknowledgement image payloads exceeded {} bytes; the turn will be interrupted",
+                                    self.maximum_output_bytes
+                                ),
+                            ),
+                        );
+                    }
+                    self.deferred_image_bytes = deferred_bytes;
+                    self.deferred_image_bytes_by_id
+                        .insert(image.id().to_owned(), image_bytes);
+                }
+            }
             let deferred = match &mut self.phase {
                 RunPhase::Starting { deferred } | RunPhase::Replaying { deferred, .. } => {
                     Some(deferred)
@@ -143,6 +212,15 @@ impl RunRoute {
                     drop(event);
                     return RunEventOutcome::IgnoredBeforeTurn;
                 };
+                if let Some(image_id) = deferred_image_id.as_deref() {
+                    deferred.retain(|notification| {
+                        !matches!(
+                            notification,
+                            DeferredRunNotification::Event { event, .. }
+                                if matches!(event.as_ref(), Event::ImageGeneration(image) if image.id() == image_id)
+                        )
+                    });
+                }
                 if deferred.len() >= event_capacity {
                     drop(event);
                     return self.record_failure(
@@ -163,13 +241,14 @@ impl RunRoute {
             }
         }
 
-        self.route_event_after_start(observed_turn_id, event)
+        self.route_event_after_start(observed_turn_id, event, event_capacity)
     }
 
     fn route_event_after_start(
         &mut self,
         observed_turn_id: Option<&str>,
         event: Event,
+        event_capacity: usize,
     ) -> RunEventOutcome {
         let mismatch = observed_turn_id.and_then(|observed| {
             self.phase.turn_id().and_then(|expected| {
@@ -195,7 +274,12 @@ impl RunRoute {
 
         match &event {
             Event::TextDelta(delta) => {
-                let Some(output_bytes) = self.text.len().checked_add(delta.len()) else {
+                let Some(output_bytes) = self
+                    .text
+                    .len()
+                    .checked_add(delta.len())
+                    .and_then(|bytes| bytes.checked_add(self.image_generation_bytes))
+                else {
                     let Some(turn_id) =
                         self.phase.turn_id().or(observed_turn_id).map(str::to_owned)
                     else {
@@ -231,6 +315,92 @@ impl RunRoute {
                 self.text.push_str(delta);
             }
             Event::UsageUpdated(usage) => self.usage = Some(*usage),
+            Event::ImageGeneration(image) => {
+                let Some(image_bytes) = image.retained_bytes() else {
+                    let Some(turn_id) =
+                        self.phase.turn_id().or(observed_turn_id).map(str::to_owned)
+                    else {
+                        return RunEventOutcome::AfterTerminal;
+                    };
+                    return self.record_failure(
+                        turn_id,
+                        Error::new(
+                            ErrorKind::ResourceLimit,
+                            "run.images",
+                            "generated image metadata overflowed the platform limit",
+                        ),
+                    );
+                };
+                let existing = self
+                    .image_generations
+                    .iter()
+                    .position(|candidate| candidate.id() == image.id());
+                if existing.is_none() && self.image_generations.len() >= event_capacity {
+                    let Some(turn_id) =
+                        self.phase.turn_id().or(observed_turn_id).map(str::to_owned)
+                    else {
+                        return RunEventOutcome::AfterTerminal;
+                    };
+                    return self.record_failure(
+                        turn_id,
+                        Error::new(
+                            ErrorKind::ResourceLimit,
+                            "run.images",
+                            "generated image item count exceeded the bounded event capacity",
+                        ),
+                    );
+                }
+                let previous_bytes = existing
+                    .and_then(|index| self.image_generations[index].retained_bytes())
+                    .unwrap_or(0);
+                let Some(retained_bytes) = self
+                    .image_generation_bytes
+                    .checked_sub(previous_bytes)
+                    .and_then(|bytes| bytes.checked_add(image_bytes))
+                else {
+                    let Some(turn_id) =
+                        self.phase.turn_id().or(observed_turn_id).map(str::to_owned)
+                    else {
+                        return RunEventOutcome::AfterTerminal;
+                    };
+                    return self.record_failure(
+                        turn_id,
+                        Error::new(
+                            ErrorKind::ResourceLimit,
+                            "run.images",
+                            "generated image output size overflowed the platform limit",
+                        ),
+                    );
+                };
+                if self
+                    .text
+                    .len()
+                    .checked_add(retained_bytes)
+                    .is_none_or(|bytes| bytes > self.maximum_output_bytes)
+                {
+                    let Some(turn_id) =
+                        self.phase.turn_id().or(observed_turn_id).map(str::to_owned)
+                    else {
+                        return RunEventOutcome::AfterTerminal;
+                    };
+                    return self.record_failure(
+                        turn_id,
+                        Error::new(
+                            ErrorKind::ResourceLimit,
+                            "run.images",
+                            format!(
+                                "generated image output exceeded {} retained bytes; the turn will be interrupted",
+                                self.maximum_output_bytes
+                            ),
+                        ),
+                    );
+                }
+                match existing {
+                    Some(index) => self.image_generations[index] = image.clone(),
+                    None => self.image_generations.push(image.clone()),
+                }
+                self.image_generation_bytes = retained_bytes;
+            }
             _ => {}
         }
         match self.events.try_send(event) {
@@ -276,11 +446,17 @@ impl RunRoute {
             }
             RunPhase::Active { .. } | RunPhase::TerminalBeforeStart { .. } => {}
         }
+        self.clear_deferred_image_bytes();
         self.pending_failure = Some(error);
         RunEventOutcome::RouteFailure {
             turn_id,
             control: Arc::clone(&self.control),
         }
+    }
+
+    fn clear_deferred_image_bytes(&mut self) {
+        self.deferred_image_bytes = 0;
+        self.deferred_image_bytes_by_id.clear();
     }
 }
 
@@ -483,6 +659,7 @@ impl RunRegistry {
         let transition = match &mut route.phase {
             RunPhase::Starting { deferred } => {
                 let deferred = std::mem::take(deferred);
+                route.clear_deferred_image_bytes();
                 route.phase = RunPhase::Replaying {
                     turn_id: turn_id.to_owned(),
                     deferred: VecDeque::new(),
@@ -530,7 +707,9 @@ impl RunRegistry {
                     };
                     ReplayTransition::Active
                 } else {
-                    ReplayTransition::Next(std::mem::take(deferred))
+                    let deferred = std::mem::take(deferred);
+                    route.clear_deferred_image_bytes();
+                    ReplayTransition::Next(deferred)
                 }
             }
             RunPhase::Starting { .. }
@@ -613,7 +792,12 @@ impl RunRegistry {
 
         let result = match route.pending_failure.take().or(queue_failure) {
             Some(error) => Err(error),
-            None => completion.into_result(thread_id, route.text.clone(), route.usage),
+            None => completion.into_result(
+                thread_id,
+                route.text.clone(),
+                route.usage,
+                route.image_generations.clone(),
+            ),
         };
         route.control.mark_provider_terminal();
         route.active.store(false, Ordering::Release);
@@ -707,6 +891,10 @@ impl RunRegistry {
                 text: String::new(),
                 maximum_output_bytes,
                 usage: None,
+                image_generations: Vec::new(),
+                image_generation_bytes: 0,
+                deferred_image_bytes: 0,
+                deferred_image_bytes_by_id: HashMap::new(),
             },
         );
         Ok(RunChannels {
@@ -722,11 +910,12 @@ impl RunRegistry {
 #[cfg(test)]
 mod tests {
     use super::{
-        PreStartFailureTransition, ReplayTransition, RunEventOutcome, RunPhase, RunRegistry,
-        StartTurnTransition, TerminalRouteOutcome,
+        DeferredRunNotification, PreStartFailureTransition, ReplayTransition, RunEventOutcome,
+        RunPhase, RunRegistry, StartTurnTransition, TerminalRouteOutcome,
     };
     use crate::error::{Error, ErrorKind};
     use crate::event::{Event, TurnCompletion};
+    use crate::image::ImageGeneration;
     use serde_json::json;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -771,6 +960,90 @@ mod tests {
             &routes.get("thread-1").expect("route").phase,
             RunPhase::Starting { deferred } if deferred.len() == 1
         ));
+    }
+
+    #[test]
+    fn pre_acknowledgement_images_count_latest_state_per_item() {
+        let registry = RunRegistry::new();
+        let _channels = registry
+            .register("thread-1", Arc::new(AtomicBool::new(true)), 4, 32)
+            .expect("run route");
+        let mut routes = registry.routes();
+        let route = routes.get_mut("thread-1").expect("route");
+
+        assert!(matches!(
+            route.route_event(
+                Some("turn-1"),
+                "item/started",
+                Event::ImageGeneration(image("inProgress", "")),
+                true,
+                4,
+            ),
+            RunEventOutcome::Deferred
+        ));
+        assert!(matches!(
+            route.route_event(
+                Some("turn-1"),
+                "item/completed",
+                Event::ImageGeneration(image("completed", "iVBORw0KGgo=")),
+                true,
+                4,
+            ),
+            RunEventOutcome::Deferred
+        ));
+        assert_eq!(route.deferred_image_bytes, 28);
+        assert_eq!(route.deferred_image_bytes_by_id.len(), 1);
+        assert_eq!(route.deferred_image_bytes_by_id.get("image-1"), Some(&28));
+        assert!(matches!(
+            &route.phase,
+            RunPhase::Starting { deferred }
+                if matches!(deferred.front(), Some(DeferredRunNotification::Event { event, .. })
+                    if matches!(event.as_ref(), Event::ImageGeneration(image)
+                        if image.status() == "completed" && image.result_base64() == "iVBORw0KGgo="))
+                    && deferred.len() == 1
+        ));
+        assert!(route.pending_failure.is_none());
+    }
+
+    #[test]
+    fn pre_acknowledgement_distinct_images_remain_bounded() {
+        let registry = RunRegistry::new();
+        let _channels = registry
+            .register("thread-1", Arc::new(AtomicBool::new(true)), 4, 32)
+            .expect("run route");
+        let mut routes = registry.routes();
+        let route = routes.get_mut("thread-1").expect("route");
+
+        assert!(matches!(
+            route.route_event(
+                Some("turn-1"),
+                "item/completed",
+                Event::ImageGeneration(image("completed", "iVBORw0KGgo=")),
+                true,
+                4,
+            ),
+            RunEventOutcome::Deferred
+        ));
+        assert!(matches!(
+            route.route_event(
+                Some("turn-1"),
+                "item/completed",
+                Event::ImageGeneration(image_with_id("image-2", "completed", "iVBORw0KGgo=")),
+                true,
+                4,
+            ),
+            RunEventOutcome::RouteFailure { .. }
+        ));
+        assert_eq!(route.deferred_image_bytes, 0);
+        assert!(route.deferred_image_bytes_by_id.is_empty());
+        assert!(matches!(
+            &route.phase,
+            RunPhase::Starting { deferred } if deferred.is_empty()
+        ));
+        assert_eq!(
+            route.pending_failure.as_ref().map(Error::kind),
+            Some(ErrorKind::ResourceLimit)
+        );
     }
 
     #[test]
@@ -846,6 +1119,108 @@ mod tests {
             route.pending_failure.as_ref().map(Error::kind),
             Some(ErrorKind::ResourceLimit)
         );
+    }
+
+    #[test]
+    fn image_lifecycle_is_replaced_and_retained_in_terminal_result() {
+        let registry = RunRegistry::new();
+        let channels = registry
+            .register("thread-1", Arc::new(AtomicBool::new(true)), 4, 1_024)
+            .expect("run route");
+        {
+            let mut routes = registry.routes();
+            let route = routes.get_mut("thread-1").expect("route");
+            route.phase = RunPhase::Active {
+                turn_id: "turn-1".to_owned(),
+            };
+            assert!(matches!(
+                route.route_event(
+                    Some("turn-1"),
+                    "item/started",
+                    Event::ImageGeneration(image("inProgress", "")),
+                    false,
+                    4,
+                ),
+                RunEventOutcome::Delivered
+            ));
+            assert!(matches!(
+                route.route_event(
+                    Some("turn-1"),
+                    "item/completed",
+                    Event::ImageGeneration(image("completed", "iVBORw0KGgo=")),
+                    false,
+                    4,
+                ),
+                RunEventOutcome::Delivered
+            ));
+            assert_eq!(route.image_generations.len(), 1);
+            assert_eq!(route.image_generations[0].status(), "completed");
+        }
+
+        assert!(matches!(
+            registry.route_terminal(
+                "thread-1",
+                TurnCompletion::completed("turn-1".to_owned()),
+                &json!({}),
+                false,
+                4,
+            ),
+            TerminalRouteOutcome::Completed
+        ));
+        let result = channels
+            .terminal
+            .borrow()
+            .clone()
+            .expect("terminal result")
+            .expect("successful terminal result");
+        assert_eq!(
+            result.image_generations,
+            vec![image("completed", "iVBORw0KGgo=")]
+        );
+    }
+
+    #[test]
+    fn image_output_limit_fails_before_retaining_unbounded_bytes() {
+        let registry = RunRegistry::new();
+        let _channels = registry
+            .register("thread-1", Arc::new(AtomicBool::new(true)), 4, 16)
+            .expect("run route");
+        let mut routes = registry.routes();
+        let route = routes.get_mut("thread-1").expect("route");
+        route.phase = RunPhase::Active {
+            turn_id: "turn-1".to_owned(),
+        };
+        assert!(matches!(
+            route.route_event(
+                Some("turn-1"),
+                "item/completed",
+                Event::ImageGeneration(image("completed", "iVBORw0KGgo=")),
+                false,
+                4,
+            ),
+            RunEventOutcome::RouteFailure { .. }
+        ));
+        assert!(route.image_generations.is_empty());
+        assert_eq!(
+            route.pending_failure.as_ref().map(Error::kind),
+            Some(ErrorKind::ResourceLimit)
+        );
+    }
+
+    fn image(status: &str, result_base64: &str) -> ImageGeneration {
+        image_with_id("image-1", status, result_base64)
+    }
+
+    fn image_with_id(id: &str, status: &str, result_base64: &str) -> ImageGeneration {
+        ImageGeneration::new(
+            id.to_owned(),
+            status.to_owned(),
+            None,
+            result_base64.to_owned(),
+            Some(false),
+            None,
+            None,
+        )
     }
 
     #[test]

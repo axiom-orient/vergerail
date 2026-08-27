@@ -548,6 +548,7 @@ checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 name = "vergerail"
 version = "0.2.0"
 dependencies = [
+ "base64",
  "flate2",
  "fs2",
  "rustix",

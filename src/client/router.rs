@@ -7,8 +7,9 @@ use crate::event::{Event, OpaqueEvent};
 use crate::private::process::ProcessEvent;
 use crate::private::protocol::{
     command_from_item, compact_notification, config_warning_message, file_change_from_item,
-    file_change_from_patch, image_generation_from_item, protocol_field, required_non_empty_string,
-    required_string, turn_completion, usage_from_notification,
+    file_change_from_patch, image_generation_from_item, image_generation_from_started_item,
+    protocol_field, required_non_empty_string, required_string, turn_completion,
+    usage_from_notification,
 };
 use crate::private::redact::redact_line;
 use crate::private::request::ResponseCompletion;
@@ -204,7 +205,11 @@ impl ClientInner {
                         }
                         Err(error) => self.disconnect(error).await,
                     },
-                    "imageGeneration" => match image_generation_from_item(item) {
+                    "imageGeneration" => match if method == "item/started" {
+                        image_generation_from_started_item(item)
+                    } else {
+                        image_generation_from_item(item)
+                    } {
                         Ok(image) => {
                             self.send_run_event(
                                 thread_id,

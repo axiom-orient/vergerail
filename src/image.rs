@@ -15,6 +15,14 @@ pub enum ImageGenerationFailure {
     },
 }
 
+impl ImageGenerationFailure {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::UsageLimitExceeded { limit_id, .. } => limit_id.len(),
+        }
+    }
+}
+
 /// One image-generation item from Codex app-server.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImageGeneration {
@@ -90,5 +98,20 @@ impl ImageGeneration {
     #[must_use]
     pub fn saved_path(&self) -> Option<&Path> {
         self.saved_path.as_deref()
+    }
+
+    pub(crate) fn retained_bytes(&self) -> Option<usize> {
+        let mut bytes = self.id.len().checked_add(self.status.len())?;
+        bytes = bytes.checked_add(self.result_base64.len())?;
+        if let Some(prompt) = self.revised_prompt.as_deref() {
+            bytes = bytes.checked_add(prompt.len())?;
+        }
+        if let Some(path) = self.saved_path.as_deref() {
+            bytes = bytes.checked_add(path.as_os_str().len())?;
+        }
+        if let Some(failure) = self.failure.as_ref() {
+            bytes = bytes.checked_add(failure.retained_bytes())?;
+        }
+        Some(bytes)
     }
 }

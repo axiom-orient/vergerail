@@ -26,7 +26,7 @@ pub(crate) use lock::{PinnedRuntime, PinnedRuntimeDownload, RuntimeArtifact, Run
 pub use manager::{DownloadPolicy, ResolvedRuntime, RuntimeOrigin, RuntimeResolver};
 
 const PINNED_SCHEMA: &[u8] =
-    include_bytes!("../protocol/codex-0.149.1/codex_app_server_protocol.v2.schemas.json");
+    include_bytes!("../protocol/codex-0.150.1/codex_app_server_protocol.v2.schemas.json");
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const VERSION_OUTPUT_LIMIT: usize = 8 * 1024;
 const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -898,7 +898,7 @@ mod tests {
         let lock = pinned.lock();
         let schema_hash = canonical_json_sha256(PINNED_SCHEMA).expect("canonical schema hash");
 
-        assert_eq!(lock.version(), "0.149.1");
+        assert_eq!(lock.version(), "0.150.1");
         assert_eq!(schema_hash, lock.protocol_schema_canonical_sha256());
     }
 

@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+if [ -n "${VERGERAIL_IMAGE_ONLY:-}" ]; then
+    echo "release verification forbids VERGERAIL_IMAGE_ONLY" >&2
+    exit 1
+fi
+
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repository_root"
 
@@ -49,6 +54,10 @@ if [ -z "${VERGERAIL_HOME_OWNER:-}" ] || [ -z "${VERGERAIL_MODEL:-}" ]; then
 fi
 if [ -z "${VERGERAIL_WORKSPACE:-}" ] || [ ! -d "${VERGERAIL_WORKSPACE:-}" ]; then
     echo "release external proof requires an existing VERGERAIL_WORKSPACE" >&2
+    exit 1
+fi
+if [ -z "${VERGERAIL_PERFECTPIXEL_BIN:-}" ] || [ ! -f "${VERGERAIL_PERFECTPIXEL_BIN:-}" ]; then
+    echo "release external proof requires an existing VERGERAIL_PERFECTPIXEL_BIN" >&2
     exit 1
 fi
 

@@ -83,14 +83,17 @@ impl Default for RuntimeResolver {
             explicit_root: None,
             cache_root: None,
             download_policy: DownloadPolicy::IfMissing,
-            search_system: true,
+            search_system: false,
             additional_system_candidates: Vec::new(),
         }
     }
 }
 
 impl RuntimeResolver {
-    /// Creates a resolver that searches `PATH` for canonical audited packages and downloads if missing.
+    /// Creates a resolver that reuses or installs the Vergerail-managed pinned runtime.
+    ///
+    /// Host `PATH` discovery is disabled by default so a terminal Codex installation
+    /// cannot select the app-server runtime implicitly.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -121,6 +124,9 @@ impl RuntimeResolver {
     }
 
     /// Enables or disables discovery of audited Codex installations on the host.
+    ///
+    /// This is an explicit opt-in; the default resolver uses only Vergerail-managed
+    /// storage and the pinned download.
     #[must_use]
     pub const fn with_system_discovery(mut self, enabled: bool) -> Self {
         self.search_system = enabled;
@@ -758,6 +764,16 @@ mod tests {
     }
 
     #[test]
+    fn default_resolver_does_not_depend_on_a_terminal_codex() {
+        let resolver = RuntimeResolver::new();
+
+        assert!(!resolver.search_system);
+        assert_eq!(resolver.download_policy, DownloadPolicy::IfMissing);
+        assert!(resolver.explicit_root.is_none());
+        assert!(resolver.additional_system_candidates.is_empty());
+    }
+
+    #[test]
     fn launch_failure_preserves_statically_verified_managed_runtime() {
         let directory = tempfile::tempdir().expect("tempdir");
         let root = directory.path().join("runtime");
@@ -888,11 +904,11 @@ mod tests {
         let pinned = PinnedRuntime::load().expect("pinned runtime");
         assert_eq!(
             managed_relative_root(pinned.lock()),
-            PathBuf::from("codex/0.149.1/aarch64-apple-darwin")
+            PathBuf::from("codex/0.150.1/aarch64-apple-darwin")
         );
         assert_eq!(
             installation_lock_name(pinned.lock()),
-            ".codex-0.149.1-aarch64-apple-darwin.lock"
+            ".codex-0.150.1-aarch64-apple-darwin.lock"
         );
     }
 

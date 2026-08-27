@@ -86,6 +86,7 @@ impl TurnCompletion {
         thread_id: &str,
         text: String,
         usage: Option<Usage>,
+        image_generations: Vec<ImageGeneration>,
     ) -> Result<RunResult> {
         let status = match self.outcome? {
             TurnOutcome::Completed => TurnStatus::Completed,
@@ -100,6 +101,7 @@ impl TurnCompletion {
             text,
             status,
             usage,
+            image_generations,
         })
     }
 }
@@ -117,6 +119,8 @@ pub struct RunResult {
     pub status: TurnStatus,
     /// Most recent token usage, when reported.
     pub usage: Option<Usage>,
+    /// Latest lifecycle state for each generated image, in first-seen order.
+    pub image_generations: Vec<ImageGeneration>,
 }
 
 /// Minimal command information suitable for display and auditing.

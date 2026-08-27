@@ -233,7 +233,8 @@ impl SessionOptions {
         self
     }
 
-    /// Sets the maximum cumulative assistant text retained for each turn.
+    /// Sets the maximum cumulative assistant text and image payload retained
+    /// for each turn.
     #[must_use]
     pub const fn with_maximum_output_bytes(mut self, bytes: usize) -> Self {
         self.maximum_output_bytes = bytes;

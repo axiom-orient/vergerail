@@ -205,8 +205,12 @@ impl Codex {
     pub async fn connect(config: CodexConfig) -> Result<Self> {
         config.validate()?;
         let runtime = config.runtime.verify().await?;
-        let home =
-            ManagedHome::prepare_for(config.codex_home.clone(), config.home_owner.clone()).await?;
+        let home = ManagedHome::prepare_with_features(
+            config.codex_home.clone(),
+            config.home_owner.clone(),
+            config.image_generation,
+        )
+        .await?;
         let (process, process_events) = ProcessHandle::spawn(&runtime, &home, &config).await?;
         let inner = Arc::new(ClientInner {
             config,

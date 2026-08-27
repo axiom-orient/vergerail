@@ -1,21 +1,23 @@
 # 배포
 
-Vergerail `0.2.0`은 Codex `0.149.1`과 Apple silicon macOS만 지원합니다. GitHub source와 crates.io 배포는 별도 gate입니다.
+Vergerail `0.2.0`은 Codex `0.150.1`과 Apple silicon macOS만 지원합니다. GitHub source와 crates.io 배포는 별도 gate입니다.
 
 ## 현재 상태
 
 | 경로 | 판정 | 남은 조건 |
 |---|---|---|
-| local path dependency | `GO` | 없음 |
-| GitHub git dependency | `GO` | 소비자가 검증된 full commit SHA를 고정해야 함 |
+| local path dependency | `CONDITIONAL` | authenticated image/full E2E와 release-verify 재실행 |
+| GitHub git dependency | `NOT RELEASED` | local candidate review, push 후 consumer full commit SHA 검증 |
 | crates.io | `OUT OF SCOPE` | `publish = false`; 별도 게시 결정과 gate가 필요 |
 
 현재 canonical source는 공개 저장소
-`https://github.com/axiom-orient/vergerail`이며 `main`에 clean committed
-source가 있습니다. public GitHub remote의 `main`과 local release commit이
-일치하고, 별도 HTTPS consumer가 검증한 full commit SHA를 고정해
-`cargo check`와 `cargo check --locked`를 통과했습니다. 소비자는 계속
-mutable branch나 tag가 아닌 각자 검증한 full SHA를 사용해야 합니다.
+`https://github.com/axiom-orient/vergerail`입니다. 0.150.1/image candidate는
+local `main`에서만 준비 중이고 `origin/main`은 `0601e9e`로 유지됩니다.
+remote release branch도 아직 삭제하지 않았습니다. non-authenticated gate는
+통과했지만 dedicated-home OAuth 승인이 timeout되어 이 상태는 배포 승인이
+아닙니다. 사용자가 승인하고 clean committed `HEAD`에서
+`scripts/release-verify.sh`가 성공한 뒤에만 push와 별도 consumer의 검증된
+full commit SHA 고정을 진행할 수 있습니다.
 
 `Cargo.toml`의 repository, homepage와 documentation URL은 canonical GitHub
 source를 가리킵니다. 현재는 crates.io 게시를 하지 않으며, tag와 release도
@@ -31,13 +33,18 @@ GitHub Actions와 `.github/workflows`는 배포 수단으로 사용하지 않습
 `scripts/release-verify.sh`를 사용해야 합니다. 후자는 먼저 `HEAD`가 존재하고
 working tree와 index가 모두 깨끗한지 확인한 뒤, aarch64 macOS에서
 `VERGERAIL_CODEX_PACKAGE`, 기존 전용 `VERGERAIL_CODEX_HOME`,
-`VERGERAIL_HOME_OWNER`, visible `VERGERAIL_MODEL`, `VERGERAIL_WORKSPACE`를
+`VERGERAIL_HOME_OWNER`, visible `VERGERAIL_MODEL`, `VERGERAIL_WORKSPACE`,
+검증할 `VERGERAIL_PERFECTPIXEL_BIN`을
 요구합니다. 그 환경으로 개발 gate(공식 runtime 2개와 IFSC signed-out 1개),
 managed runtime download/reuse, authenticated live E2E를 직접 실행하고 마지막으로
 `cargo package --offline --locked`를 `--allow-dirty` 없이 실행합니다. credential은
 읽거나 복사하지 않습니다. committed `HEAD`가 없거나 working tree가 dirty인
 checkout에서는 이 release entrypoint가 전제조건 오류로 종료하며, clean committed
 `HEAD`에서는 위 external suite와 final package 검증을 수행합니다.
+
+현재 release 결정은 `NEEDS_USER`/`NO-GO`입니다. OAuth가 완료되지 않은
+상태에서는 성공 marker를 추정하지 않으며, 재시도·새 인증 세션·배포를 하지
+않습니다.
 
 ## GitHub source
 

@@ -23,6 +23,7 @@ static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct ManagedHome {
     root: PathBuf,
     projects: Arc<Mutex<BTreeSet<PathBuf>>>,
+    image_generation: bool,
     _ownership: File,
 }
 
@@ -43,8 +44,17 @@ impl ManagedHome {
         Self::prepare_for(root, "vergerail".to_owned()).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn prepare_for(root: PathBuf, owner: String) -> Result<Arc<Self>> {
-        tokio::task::spawn_blocking(move || prepare_blocking(root, owner))
+        Self::prepare_with_features(root, owner, false).await
+    }
+
+    pub(crate) async fn prepare_with_features(
+        root: PathBuf,
+        owner: String,
+        image_generation: bool,
+    ) -> Result<Arc<Self>> {
+        tokio::task::spawn_blocking(move || prepare_blocking(root, owner, image_generation))
             .await
             .map_err(|error| {
                 Error::new(
@@ -78,7 +88,7 @@ impl ManagedHome {
         }
         let home = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            commit_untrusted_project(&home.root, projects, canonical)
+            commit_untrusted_project(&home.root, projects, canonical, home.image_generation)
         })
         .await
         .map_err(|error| {
@@ -134,17 +144,22 @@ fn commit_untrusted_project(
     root: &Path,
     mut projects: OwnedMutexGuard<BTreeSet<PathBuf>>,
     canonical: PathBuf,
+    image_generation: bool,
 ) -> Result<PathBuf> {
     // The owned admission guard remains in the blocking worker. Cancellation of
     // the awaiting caller cannot release ordering before disk and memory agree.
     let mut snapshot = projects.clone();
     snapshot.insert(canonical.clone());
-    write_managed_files(root, &snapshot)?;
+    write_managed_files(root, &snapshot, image_generation)?;
     *projects = snapshot;
     Ok(canonical)
 }
 
-fn prepare_blocking(root: PathBuf, owner: String) -> Result<Arc<ManagedHome>> {
+fn prepare_blocking(
+    root: PathBuf,
+    owner: String,
+    image_generation: bool,
+) -> Result<Arc<ManagedHome>> {
     let marker = home_marker(&owner);
     ensure_real_directory(&root, true, "codex_home.create")?;
     let root = root.canonicalize().map_err(|error| {
@@ -168,7 +183,7 @@ fn prepare_blocking(root: PathBuf, owner: String) -> Result<Arc<ManagedHome>> {
     let mut state = inspection.state;
     let removed_stale_projects = prune_stale_projects(&mut state.projects);
 
-    let expected = render_config(&state.projects)?;
+    let expected = render_config(&state.projects, image_generation)?;
     let config_path = root.join(CONFIG_FILE);
     if existing_regular_file(&config_path, "codex_home.config")? {
         let existing = fs::read_to_string(&config_path).map_err(|error| {
@@ -185,12 +200,12 @@ fn prepare_blocking(root: PathBuf, owner: String) -> Result<Arc<ManagedHome>> {
             ));
         }
         if removed_stale_projects {
-            write_managed_files(&root, &state.projects)?;
+            write_managed_files(&root, &state.projects, image_generation)?;
         } else if existing != expected {
             atomic_write(&config_path, expected.as_bytes())?;
         }
     } else {
-        write_managed_files(&root, &state.projects)?;
+        write_managed_files(&root, &state.projects, image_generation)?;
     }
 
     let workdir = root.join(RUNTIME_WORKDIR);
@@ -200,6 +215,7 @@ fn prepare_blocking(root: PathBuf, owner: String) -> Result<Arc<ManagedHome>> {
     Ok(Arc::new(ManagedHome {
         root,
         projects: Arc::new(Mutex::new(state.projects)),
+        image_generation,
         _ownership: ownership,
     }))
 }
@@ -519,7 +535,11 @@ fn existing_regular_file(path: &Path, operation: &'static str) -> Result<bool> {
     }
 }
 
-fn write_managed_files(root: &Path, projects: &BTreeSet<PathBuf>) -> Result<()> {
+fn write_managed_files(
+    root: &Path,
+    projects: &BTreeSet<PathBuf>,
+    image_generation: bool,
+) -> Result<()> {
     let state = serde_json::to_vec_pretty(&ProjectState {
         projects: projects.clone(),
     })
@@ -528,13 +548,13 @@ fn write_managed_files(root: &Path, projects: &BTreeSet<PathBuf>) -> Result<()> 
     // derived Codex config first so a failed config replacement cannot commit
     // a project that the current process did not accept. If the final state
     // write fails, the next prepare regenerates config from the older state.
-    let config = render_config(projects)?;
+    let config = render_config(projects, image_generation)?;
     atomic_write(&root.join(CONFIG_FILE), config.as_bytes())?;
     atomic_write(&root.join(PROJECT_STATE_FILE), &state)?;
     Ok(())
 }
 
-fn render_config(projects: &BTreeSet<PathBuf>) -> Result<String> {
+fn render_config(projects: &BTreeSet<PathBuf>, image_generation: bool) -> Result<String> {
     let mut output = String::from(MANAGED_HEADER);
     output.push_str(
         "check_for_update_on_startup = false\n\
@@ -556,7 +576,15 @@ fn render_config(projects: &BTreeSet<PathBuf>) -> Result<String> {
          computer_use = false\n\
          goals = false\n\
          hooks = false\n\
-         image_generation = false\n\
+         image_generation = ",
+    );
+    output.push_str(if image_generation {
+        "true\n"
+    } else {
+        "false\n"
+    });
+    output.push_str(
+        "\
          in_app_browser = false\n\
          multi_agent = false\n\
          plugin_sharing = false\n\
@@ -892,7 +920,7 @@ mod tests {
         let config_path = directory.path().join("config.toml");
         fs::write(
             &config_path,
-            render_config(&BTreeSet::new()).expect("render managed config"),
+            render_config(&BTreeSet::new(), false).expect("render managed config"),
         )
         .expect("write unmarked managed config");
 
@@ -1012,11 +1040,50 @@ mod tests {
         drop(repaired);
         assert_eq!(
             fs::read_to_string(directory.path().join("config.toml")).expect("config"),
-            render_config(&BTreeSet::new()).expect("render empty config")
+            render_config(&BTreeSet::new(), false).expect("render empty config")
         );
         assert_eq!(
             fs::read(directory.path().join(HOME_MARKER_FILE)).expect("managed marker"),
             home_marker("vergerail").as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn image_generation_is_explicit_and_survives_project_registration() {
+        let home_directory = tempfile::tempdir().expect("home tempdir");
+        let project_directory = tempfile::tempdir().expect("project tempdir");
+        let home = ManagedHome::prepare_with_features(
+            home_directory.path().to_path_buf(),
+            "vergerail".to_owned(),
+            true,
+        )
+        .await
+        .expect("image-enabled managed home");
+
+        assert!(
+            fs::read_to_string(home_directory.path().join(CONFIG_FILE))
+                .expect("enabled config")
+                .contains("image_generation = true")
+        );
+        home.register_untrusted_project(project_directory.path())
+            .await
+            .expect("project registration");
+        assert!(
+            fs::read_to_string(home_directory.path().join(CONFIG_FILE))
+                .expect("updated enabled config")
+                .contains("image_generation = true")
+        );
+
+        drop(home);
+        let disabled =
+            ManagedHome::prepare_for(home_directory.path().to_path_buf(), "vergerail".to_owned())
+                .await
+                .expect("default-disabled managed home");
+        drop(disabled);
+        assert!(
+            fs::read_to_string(home_directory.path().join(CONFIG_FILE))
+                .expect("disabled config")
+                .contains("image_generation = false")
         );
     }
 
@@ -1104,7 +1171,7 @@ mod tests {
         assert!(state.projects.is_empty());
         assert_eq!(
             fs::read_to_string(home_directory.path().join("config.toml")).expect("config"),
-            render_config(&BTreeSet::new()).expect("empty config")
+            render_config(&BTreeSet::new(), false).expect("empty config")
         );
     }
 
@@ -1127,7 +1194,7 @@ mod tests {
         let detached_root = home_directory.path().to_path_buf();
         let detached_first = first.clone();
         let detached = tokio::task::spawn_blocking(move || {
-            commit_untrusted_project(&detached_root, first_guard, detached_first)
+            commit_untrusted_project(&detached_root, first_guard, detached_first, false)
         });
         drop(detached);
 
@@ -1142,7 +1209,7 @@ mod tests {
         let second_root = home_directory.path().to_path_buf();
         let second_value = second.clone();
         tokio::task::spawn_blocking(move || {
-            commit_untrusted_project(&second_root, second_guard, second_value)
+            commit_untrusted_project(&second_root, second_guard, second_value, false)
         })
         .await
         .expect("second worker")

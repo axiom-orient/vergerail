@@ -175,15 +175,32 @@ pub(crate) fn file_change_from_patch(params: &Value) -> Result<FileChangeSummary
 }
 
 pub(crate) fn image_generation_from_item(item: &Value) -> Result<ImageGeneration> {
+    image_generation_from_item_with_status(item, false)
+}
+
+pub(crate) fn image_generation_from_started_item(item: &Value) -> Result<ImageGeneration> {
+    image_generation_from_item_with_status(item, true)
+}
+
+fn image_generation_from_item_with_status(
+    item: &Value,
+    allow_empty_status: bool,
+) -> Result<ImageGeneration> {
     const OPERATION: &str = "item.imageGeneration";
     let saved_path = optional_string(item, "savedPath", OPERATION)?.map(PathBuf::from);
     if saved_path.as_ref().is_some_and(|path| !path.is_absolute()) {
         return Err(protocol_field(OPERATION, "savedPath"));
     }
 
+    let status = if allow_empty_status {
+        required_string(item, "status", OPERATION)?
+    } else {
+        required_non_empty_string(item, "status", OPERATION)?
+    };
+
     Ok(ImageGeneration::new(
         required_non_empty_string(item, "id", OPERATION)?,
-        required_non_empty_string(item, "status", OPERATION)?,
+        status,
         optional_string(item, "revisedPrompt", OPERATION)?,
         required_string(item, "result", OPERATION)?,
         optional_bool(item, "transparentBackground", OPERATION)?,
@@ -475,6 +492,25 @@ mod tests {
     }
 
     #[test]
+    fn image_generation_started_item_allows_empty_status_but_durable_items_do_not() {
+        let item = json!({
+            "type": "imageGeneration",
+            "id": "image-1",
+            "status": "",
+            "result": ""
+        });
+
+        let started = image_generation_from_started_item(&item)
+            .expect("item/started may carry an empty provider status");
+        assert_eq!(started.status(), "");
+
+        let durable = image_generation_from_item(&item)
+            .expect_err("durable/a completed image item must keep a non-empty status");
+        assert_eq!(durable.kind(), ErrorKind::Protocol);
+        assert_eq!(durable.operation(), "item.imageGeneration");
+    }
+
+    #[test]
     fn image_generation_rejects_malformed_optional_fields_and_paths() {
         for item in [
             json!({
@@ -606,7 +642,7 @@ mod tests {
         .expect("completed turn");
         assert_eq!(
             completed
-                .into_result("thread-1", "done".to_owned(), None)
+                .into_result("thread-1", "done".to_owned(), None, Vec::new())
                 .expect("result")
                 .status,
             TurnStatus::Completed
@@ -620,7 +656,7 @@ mod tests {
             }
         }))
         .expect("failed envelope")
-        .into_result("thread-1", String::new(), None)
+        .into_result("thread-1", String::new(), None, Vec::new())
         .expect_err("failed result");
         assert_eq!(failed.kind(), ErrorKind::Rpc);
         assert!(!failed.message().contains("secret-token"));
@@ -629,7 +665,7 @@ mod tests {
             "turn": {"id": "turn-3", "status": "inProgress"}
         }))
         .expect("terminal envelope")
-        .into_result("thread-1", String::new(), None)
+        .into_result("thread-1", String::new(), None, Vec::new())
         .expect_err("unexpected status");
         assert_eq!(unknown.kind(), ErrorKind::Protocol);
     }

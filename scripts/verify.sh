@@ -26,6 +26,12 @@ if grep -n -E 'VERGERAIL_GUARDIAN_LEGACY_MUTANT|legacy-ack|first-empty-scan' \
     exit 1
 fi
 
+if ! VERGERAIL_IMAGE_ONLY=1 scripts/release-verify.sh 2>&1 \
+    | grep -q '^release verification forbids VERGERAIL_IMAGE_ONLY$'; then
+    echo "release verification image-only bypass guard is missing" >&2
+    exit 1
+fi
+
 cargo fmt --all -- --check
 cargo check --offline --locked --all-targets
 # Guardian-backed contract tests start real macOS process boundaries. Keep the
@@ -36,7 +42,7 @@ cargo test --offline --locked --doc
 cargo clippy --offline --locked --all-targets -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --offline --locked --no-deps
 cargo deny check
-(cd protocol/codex-0.149.1 && shasum -a 256 -c SHA256SUMS)
+(cd protocol/codex-0.150.1 && shasum -a 256 -c SHA256SUMS)
 cargo package --offline --locked --allow-dirty
 
 if [ -n "${VERGERAIL_CODEX_PACKAGE:-}" ]; then

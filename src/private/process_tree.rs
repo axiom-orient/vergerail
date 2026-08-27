@@ -510,6 +510,27 @@ sleep 10 while 1;
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn wait_for_file_contents_blocking(
+        path: &Path,
+        expected: &[u8],
+        limit: Duration,
+    ) -> io::Result<bool> {
+        let deadline = Instant::now() + limit;
+        loop {
+            match fs::read(path) {
+                Ok(contents) if contents == expected => return Ok(true),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn wait_for_fixture_pid_state_blocking(
         pid: u32,
         fixture_marker: &Path,
@@ -827,14 +848,13 @@ sleep 10 while 1;
             if !wait_for_file_blocking(&ready, Duration::from_secs(2)) {
                 return Err(io::Error::other("mutation TERM handler did not reach gate"));
             }
-            if !wait_for_file_blocking(&ack, Duration::from_secs(2)) {
+            if !wait_for_file_contents_blocking(
+                &ack,
+                b"first-empty-scan\n",
+                Duration::from_secs(2),
+            )? {
                 return Err(io::Error::other(
                     "test-only first-empty-scan fixture did not acknowledge",
-                ));
-            }
-            if fs::read_to_string(&ack)?.trim() != "first-empty-scan" {
-                return Err(io::Error::other(
-                    "test-only scan acknowledgement was malformed",
                 ));
             }
             fs::write(&release, b"release")?;

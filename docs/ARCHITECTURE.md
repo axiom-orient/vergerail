@@ -45,7 +45,7 @@ Vergerail은 `auth.json`, Chrome cookie, 브라우저 profile, access token을 �
 |---|---|
 | `runtime/lock.rs` | embedded JSON에서 runtime identity·download metadata를 파싱하고 identifier·path·hash 불변식 검증 |
 | `runtime.rs` | package layout·권한·artifact hash·manifest·schema·실행 version 검증 |
-| `runtime/manager.rs` | system/cache 후보 탐색, bounded download, allowlist extraction, atomic install과 cache 재사용 |
+| `runtime/manager.rs` | 기본 managed-cache 탐색, bounded download, allowlist extraction, atomic install과 cache 재사용; system package 탐색은 명시적 opt-in |
 | `client.rs`의 `ClientInner` | outbound use case와 shutdown 순서를 조정하는 coordinator. 원시 상태 collection을 직접 소유하지 않음 |
 | `client/router.rs` | inbound JSON-RPC 분류, notification/reverse-request adapter, protocol 위반 격리 |
 | `private/request.rs` | pending request id, response handoff, timeout/cancellation과 비멱등 결과 소유권 |
