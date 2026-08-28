@@ -1,0 +1,25 @@
+spec_rev=HM-REL-01501-r2 outcome_id=release_codex_01501_image_low
+
+candidate_sha=eef5017eea203c3d55c5f47e6d3aa618ec256d6c candidate_tree=732c8cdc72a0e57a9e0d25a81bc81ee6fdcb3064 clean_before=true clean_after=true
+
+captured=2026-08-28 host=Apple silicon macOS target=aarch64-apple-darwin
+
+Codex_package=0.150.1 archive_bytes=117535191 archive_sha256=e5008a5b8d7a22e2ad2922a74783de8f7202b7b886a181e6ddbec7633609c885 schema_and_provenance=PASS
+
+scripts/verify.sh=exit0 counts=library161 IFSC_binary5 IFSC_protocol5 live_harness22 doctest=PASS clippy=PASS rustdoc=PASS cargo_deny=PASS package=PASS
+
+official_runtime=2_passed IFSC_signed_out=1_passed managed_runtime=1_passed final_cargo_package=PASS release_verify=exit0
+
+image_only_e2e code_equivalent_commit=3ea54edff09e460f5485ddf6937587f9485ab330 model=gpt-5.6-luna reasoning=low marker=VERGERAIL_IMAGE_E2E_OK_id=exec-76364191-138e-4e10-b5ba-441b2922765d_width=1254_height=1254_foregroundPixels=1572516_modifiedWidth=512_modifiedHeight=512_modifiedForegroundPixels=262144_reasoning=low marker=VERGERAIL_IMAGE_ONLY_OK_model=gpt-5.6-luna_owner=prompt-contract_reasoning=low
+
+full_release_verify_e2e model=gpt-5.6-luna reasoning=low marker=VERGERAIL_IMAGE_E2E_OK_id=exec-249d9265-fa8e-4932-8bd7-c3df0571fb09_width=1254_height=1254_foregroundPixels=1572516_modifiedWidth=512_modifiedHeight=512_modifiedForegroundPixels=262144_reasoning=low marker=VERGERAIL_LIVE_E2E_FULL_OK_model=gpt-5.6-luna_owner=prompt-contract
+
+process_custody prior_image_only_and_final_full: PerfectPixel Codex guardian harness immediate_survivors=0 delayed_plus5s_survivors=0 stdio_pipe_closure=PASS; evidence_only_follow_up_runtime_processes_launched=0; user_owned_ChatGPT_processes_untouched
+
+scope provider_work=excluded Linux_work=excluded; public defaults schema runtime locks protocol strictness non_image_sessions unchanged
+
+preservation_sha=1992d26949563169426bc7bc4675fb56ea3988c0 retained; remote_branch_B=3e70dcf6599d40cfc22a82cee82e3627ff19559b is_ancestor_of_candidate=true
+
+pending remote_push consumer_full_sha_verification remote_branch_delete remain_pending; no_remote_ref_mutation
+
+redaction: no OAuth URL or state, email, token, home contents, temp paths, credentials, or secrets recorded
