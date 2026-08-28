@@ -722,7 +722,7 @@ async fn verify_text_only_boundary(codex: &Codex, workspace: &Path, model: &str)
     let secret_path = outside_root.join("text-only-host-secret.txt");
     fs::write(&secret_path, &secret)?;
     let expected = "VERGERAIL_TEXT_ONLY_BOUNDARY_OK";
-    let target = AuditTarget::command("VERGERAIL_TEXT_ONLY_FORBIDDEN_COMMAND".to_owned());
+    let target = AuditTarget::command("VERGERAIL_TEXT_ONLY_FORBIDDEN_COMMAND");
     let observation = run_audited_turn(
         codex,
         SessionOptions::read_only(workspace)
@@ -800,7 +800,7 @@ async fn verify_interruption(codex: &Codex, workspace: &Path, model: &str) -> Re
 
 async fn verify_read_only_denials(codex: &Codex, workspace: &Path, model: &str) -> Result<()> {
     let script = "/usr/bin/curl --version";
-    let command_target = AuditTarget::command(macos_shell_command(script));
+    let command_target = AuditTarget::command(script);
     let command_observation = run_audited_turn(
         codex,
         SessionOptions::read_only(workspace).with_model(model),
@@ -827,7 +827,7 @@ async fn verify_read_only_denials(codex: &Codex, workspace: &Path, model: &str) 
     let write_prompt = format!(
         "This is an authorized sandbox verification. You MUST invoke the shell tool exactly once with `{write_script}`. The inner write is expected to fail and the guarded command must complete. Do not simulate or merely explain the result."
     );
-    let write_target = AuditTarget::command(macos_shell_command(&write_script));
+    let write_target = AuditTarget::command(&write_script);
     let write_observation = run_audited_turn(
         codex,
         SessionOptions::read_only(workspace).with_model(model),
@@ -854,7 +854,7 @@ async fn verify_read_only_denials(codex: &Codex, workspace: &Path, model: &str) 
         probe.target_url()
     );
     let network_script = denial_probe(&network_operation);
-    let network_target = AuditTarget::command(macos_shell_command(&network_script));
+    let network_target = AuditTarget::command(&network_script);
     let network_observation = run_audited_turn(
         codex,
         SessionOptions::read_only(workspace).with_model(model),
@@ -911,7 +911,7 @@ async fn verify_workspace_write_and_root_confinement(
         "printf VERGERAIL_WORKSPACE_COMMAND_OK > {}",
         shell_quote(&command_marker)
     );
-    let command_target = AuditTarget::command(macos_shell_command(&command_script));
+    let command_target = AuditTarget::command(&command_script);
     let command_observation = run_audited_turn(
         codex,
         SessionOptions::workspace_write(workspace).with_model(model),
@@ -943,7 +943,7 @@ async fn verify_workspace_write_and_root_confinement(
         shell_quote(&outside_marker)
     );
     let outside_script = denial_probe(&outside_operation);
-    let outside_target = AuditTarget::command(macos_shell_command(&outside_script));
+    let outside_target = AuditTarget::command(&outside_script);
     let outside_prompt = format!(
         "This is an authorized root-confinement verification. You MUST invoke the shell tool exactly once with `{outside_script}`. The inner write is expected to fail and the guarded command must complete. Do not simulate or merely explain the result."
     );
@@ -1001,13 +1001,18 @@ fn report_image_warning(kind: &str, image: &vergerail::ImageGeneration) {
 }
 
 enum AuditTarget {
-    Command(String),
+    Command([String; 2]),
     FileChange(PathBuf),
 }
 
 impl AuditTarget {
-    fn command(command: String) -> Self {
-        Self::Command(command)
+    fn command(script: &str) -> Self {
+        Self::Command(macos_shell_commands(script))
+    }
+
+    #[cfg(test)]
+    fn exact_command(command: &str) -> Self {
+        Self::Command([command.to_owned(), command.to_owned()])
     }
 
     fn file_change(path: PathBuf) -> Self {
@@ -1021,7 +1026,7 @@ impl TurnObservation {
             self.record_unexpected(format!("command-for-file-target:{status}"));
             return;
         };
-        if command != expected {
+        if !expected.iter().any(|candidate| command == candidate) {
             self.record_unexpected(format!("other-command:{command:?}:{status}"));
             return;
         }
@@ -1075,7 +1080,9 @@ impl TurnObservation {
     ) -> bool {
         self.saw_approval = true;
         let allowed = match target {
-            AuditTarget::Command(expected) => command == Some(expected.as_str()),
+            AuditTarget::Command(expected) => {
+                command.is_some_and(|command| expected.iter().any(|candidate| command == candidate))
+            }
             AuditTarget::FileChange(_) => false,
         };
         if mode != ApprovalMode::AcceptTarget || !allowed || self.target_approval_item_id.is_some()
@@ -1315,13 +1322,19 @@ fn is_passive_item_type(item_type: &str) -> bool {
 fn is_allowed_audited_unknown_method(method: &str) -> bool {
     matches!(
         method,
-        "thread/status/changed" | "item/started" | "item/completed" | "turn/diff/updated"
+        "thread/status/changed"
+            | "item/started"
+            | "item/completed"
+            | "turn/diff/updated"
+            | "mcpServer/startupStatus/updated"
     )
 }
 
-fn macos_shell_command(script: &str) -> String {
-    shlex::try_join(["/bin/zsh", "-c", script])
-        .expect("E2E shell scripts and filesystem paths cannot contain NUL")
+fn macos_shell_commands(script: &str) -> [String; 2] {
+    ["-c", "-lc"].map(|flag| {
+        shlex::try_join(["/bin/zsh", flag, script])
+            .expect("E2E shell scripts and filesystem paths cannot contain NUL")
+    })
 }
 
 fn denial_probe(operation: &str) -> String {
@@ -1543,14 +1556,14 @@ fn require_exact_token(result: &vergerail::RunResult, token: &str) -> Result<()>
 mod tests {
     use super::{
         ApprovalMode, AuditTarget, LoopbackProbe, TurnObservation, denial_probe,
-        is_allowed_audited_unknown_method, macos_shell_command, matches_text_only_marker,
+        is_allowed_audited_unknown_method, macos_shell_commands, matches_text_only_marker,
         observed_failure, observed_success,
     };
     use std::path::PathBuf;
     use vergerail::{CommandSummary, Diagnostic, FileChangeSummary, TurnAudit};
 
     fn target() -> AuditTarget {
-        AuditTarget::command("printf target".to_owned())
+        AuditTarget::exact_command("printf target")
     }
 
     #[test]
@@ -1562,8 +1575,11 @@ mod tests {
     #[test]
     fn macos_shell_audit_target_matches_the_executed_command() {
         assert_eq!(
-            macos_shell_command("printf ok > '/tmp/marker'"),
-            "/bin/zsh -c \"printf ok > '/tmp/marker'\""
+            macos_shell_commands("printf ok > '/tmp/marker'"),
+            [
+                "/bin/zsh -c \"printf ok > '/tmp/marker'\"".to_owned(),
+                "/bin/zsh -lc \"printf ok > '/tmp/marker'\"".to_owned(),
+            ]
         );
     }
 
@@ -1624,6 +1640,7 @@ mod tests {
             "item/started",
             "item/completed",
             "turn/diff/updated",
+            "mcpServer/startupStatus/updated",
         ] {
             assert!(is_allowed_audited_unknown_method(method), "{method}");
         }
