@@ -49,4 +49,6 @@ if [ -n "${VERGERAIL_CODEX_PACKAGE:-}" ]; then
     cargo test --offline --locked --test official_runtime -- --ignored --nocapture
     cargo test --offline --locked --test ifsc_text_provider_protocol \
         official_runtime_signed_out_path_is_typed_and_clean -- --ignored --nocapture
+    cargo test --offline --locked --test vergerail_provider_protocol \
+        official_runtime_signed_out_path_is_typed_and_clean -- --ignored --nocapture
 fi

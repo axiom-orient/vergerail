@@ -636,7 +636,14 @@ impl ClientInner {
     ) -> Result<Session> {
         let _lifecycle = self.sessions.lock_lifecycle().await;
         let options = options.validate()?;
-        let cwd = if options.is_text_only() {
+        if options.is_image_only() && !self.config.image_generation {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "thread.start",
+                "image-only sessions require CodexConfig::with_image_generation(true)",
+            ));
+        }
+        let cwd = if options.is_text_only() || options.is_image_only() {
             self.home.validate_transient_project(options.cwd()).await?
         } else {
             self.home.register_untrusted_project(options.cwd()).await?
@@ -653,7 +660,7 @@ impl ClientInner {
                     "model": options.model_value(),
                     "baseInstructions": options.base_instructions(),
                     "developerInstructions": options.developer_instructions(),
-                    "config": text_only_thread_config(options.is_text_only())
+                    "config": thread_config(options.is_text_only(), options.is_image_only())
                 }),
                 true,
                 "thread.start",
@@ -699,6 +706,13 @@ impl ClientInner {
             ));
         }
         let options = options.validate()?;
+        if options.is_image_only() && !self.config.image_generation {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "thread.resume",
+                "image-only sessions require CodexConfig::with_image_generation(true)",
+            ));
+        }
         if options.is_ephemeral() {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
@@ -714,7 +728,7 @@ impl ClientInner {
                 "thread is already loaded by this client",
             ));
         }
-        let cwd = if options.is_text_only() {
+        let cwd = if options.is_text_only() || options.is_image_only() {
             self.home.validate_transient_project(options.cwd()).await?
         } else {
             self.home.register_untrusted_project(options.cwd()).await?
@@ -731,7 +745,7 @@ impl ClientInner {
                     "model": options.model_value(),
                     "baseInstructions": options.base_instructions(),
                     "developerInstructions": options.developer_instructions(),
-                    "config": text_only_thread_config(options.is_text_only())
+                    "config": thread_config(options.is_text_only(), options.is_image_only())
                 }),
                 true,
                 "thread.resume",
@@ -924,6 +938,7 @@ impl ClientInner {
         sandbox: Sandbox,
         reasoning: crate::session::ReasoningEffort,
         prompt: String,
+        output_schema: Option<Value>,
     ) -> Result<String> {
         let sandbox_policy = match sandbox {
             Sandbox::ReadOnly => json!({
@@ -938,22 +953,19 @@ impl ClientInner {
                 "excludeSlashTmp": true
             }),
         };
-        let response = self
-            .request(
-                "turn/start",
-                json!({
-                    "threadId": thread_id,
-                    "input": [{"type": "text", "text": prompt, "text_elements": []}],
-                    "cwd": cwd,
-                    "effort": reasoning.value(),
-                    "approvalPolicy": sandbox.approval_policy(),
-                    "approvalsReviewer": "user",
-                    "sandboxPolicy": sandbox_policy
-                }),
-                true,
-                "turn.start",
-            )
-            .await;
+        let mut params = json!({
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt, "text_elements": []}],
+            "cwd": cwd,
+            "effort": reasoning.value(),
+            "approvalPolicy": sandbox.approval_policy(),
+            "approvalsReviewer": "user",
+            "sandboxPolicy": sandbox_policy
+        });
+        if let Some(schema) = output_schema {
+            params["outputSchema"] = schema;
+        }
+        let response = self.request("turn/start", params, true, "turn.start").await;
         let response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -1548,8 +1560,8 @@ impl Drop for ClientInner {
     }
 }
 
-fn text_only_thread_config(enabled: bool) -> Value {
-    if !enabled {
+fn thread_config(text_only: bool, image_only: bool) -> Value {
+    if !text_only && !image_only {
         return Value::Null;
     }
     json!({
@@ -1558,6 +1570,7 @@ fn text_only_thread_config(enabled: bool) -> Value {
             "apps": false,
             "goals": false,
             "hooks": false,
+            "image_generation": image_only,
             "memories": false,
             "multi_agent": false,
             "plugins": false,
@@ -1607,16 +1620,60 @@ mod waiter_guard_tests {
 
     #[test]
     fn text_only_config_disables_every_execution_and_external_context_surface() {
-        let config = text_only_thread_config(true);
+        let config = thread_config(true, false);
         assert_eq!(config.pointer("/features/shell_tool"), Some(&json!(false)));
         assert_eq!(config.pointer("/features/apps"), Some(&json!(false)));
+        assert_eq!(
+            config.pointer("/features/image_generation"),
+            Some(&json!(false))
+        );
         assert_eq!(config.pointer("/features/multi_agent"), Some(&json!(false)));
         assert_eq!(config.get("web_search"), Some(&json!("disabled")));
         assert_eq!(
             config.pointer("/memories/use_memories"),
             Some(&json!(false))
         );
-        assert_eq!(text_only_thread_config(false), Value::Null);
+        assert_eq!(thread_config(false, false), Value::Null);
+    }
+
+    #[test]
+    fn image_only_config_enables_exactly_image_generation() {
+        let config = thread_config(false, true);
+        assert_eq!(config.pointer("/web_search"), Some(&json!("disabled")));
+        assert_eq!(
+            config.pointer("/features/image_generation"),
+            Some(&json!(true))
+        );
+        for feature in [
+            "apps",
+            "goals",
+            "hooks",
+            "memories",
+            "multi_agent",
+            "plugins",
+            "remote_plugin",
+            "shell_tool",
+            "skill_mcp_dependency_install",
+            "unified_exec",
+        ] {
+            assert_eq!(
+                config.pointer(&format!("/features/{feature}")),
+                Some(&json!(false))
+            );
+        }
+        assert_eq!(
+            config.pointer("/apps/_default/enabled"),
+            Some(&json!(false))
+        );
+        assert_eq!(config.pointer("/history/persistence"), Some(&json!("none")));
+        assert_eq!(
+            config.pointer("/memories/generate_memories"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            config.pointer("/memories/use_memories"),
+            Some(&json!(false))
+        );
     }
 
     #[test]

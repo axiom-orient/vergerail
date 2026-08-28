@@ -2,14 +2,14 @@
 
 > Verified runtimes. Explicit authority.
 
-Vergerail은 Rust 애플리케이션에서 고정된 OpenAI Codex app-server를 로컬 자식 프로세스로 사용하는 라이브러리입니다. 검증된 runtime을 stdio JSONL로 연결하며, 범용 provider SDK·HTTP client·공개 daemon은 아닙니다. 저장소에는 정적 IFSC `ScreenProgram`을 생성하는 one-shot `ifsc_text_provider` binary도 있습니다.
+Vergerail은 Rust 애플리케이션에서 고정된 OpenAI Codex app-server를 로컬 자식 프로세스로 사용하는 라이브러리입니다. 검증된 runtime을 stdio JSONL로 연결하며, 범용 provider SDK·HTTP client·공개 daemon은 아닙니다. 저장소에는 정적 IFSC `ScreenProgram`용 `ifsc_text_provider`와 UpAgent의 `vergerail.provider/1` 계약을 제공하는 `vergerail_provider` one-shot binary도 있습니다.
 
 현재 checkout은 Apple silicon macOS, Codex `0.150.1`, Rust `1.97.1` 이상을 지원합니다. 이 프로젝트는 공개 GitHub source로 배포하며, `publish = false` 설정으로 crates.io에는 게시하지 않습니다. 상세 증거와 배포 조건은 [검증](docs/VERIFICATION.md)과 [배포](docs/RELEASE.md) 문서가 관리합니다.
 
 ## 저장소 계약
 
-- 입력: `Cargo.toml`·`Cargo.lock`, `runtime/` lock, `protocol/` schema·provenance, library 또는 IFSC 요청
-- 출력: Rust library API와 `ifsc_text_provider`의 stdout JSON 한 값
+- 입력: `Cargo.toml`·`Cargo.lock`, `runtime/` lock, `protocol/` schema·provenance, library·IFSC·UpAgent provider 요청
+- 출력: Rust library API와 각 provider binary의 stdout JSON 한 값
 - 산출물: Cargo가 재생성하는 `target/`; source·credential·전용 `CODEX_HOME`과 분리
 
 ```bash
@@ -127,6 +127,8 @@ text adapter는 `SessionOptions::read_only(...).text_only()`와 전용 base/deve
 
 `ifsc_text_provider`의 환경, stdin/stdout schema와 실패 의미는 [IFSC provider 계약](docs/IFSC_TEXT_PROVIDER.md)을 따릅니다.
 
+UpAgent는 `vergerail_provider`를 한 요청당 한 프로세스로 실행합니다. 이 binary는 managed home, audited runtime package, owner, model, read-only workspace를 환경으로 명시적으로 받아 `model_turn` 또는 `image_generate` 한 번만 처리합니다. 모델 응답은 native `outputSchema`와 text-only mode를, 이미지는 image-only mode와 persistent audit을 사용합니다. wire reasoning은 `off`, `low`, `medium`, `high`, `xhigh`, `max`이며 자세한 실패·상한 계약은 [UpAgent provider 계약](docs/PROVIDER_CONTRACT.md)을 따릅니다.
+
 ## 주요 API
 
 - 연결·실행: `Codex`, `CodexConfig`, `Session`, `Run`, `SessionOptions`, `Sandbox`
@@ -142,6 +144,7 @@ text adapter는 `SessionOptions::read_only(...).text_only()`와 전용 base/deve
 - [아키텍처](docs/ARCHITECTURE.md): 책임, 상태 owner, 시작·종료 흐름
 - [프로토콜 계약](docs/PROTOCOL_CONTRACT.md): wire, sandbox, 재시도와 terminal 의미
 - [IFSC provider 계약](docs/IFSC_TEXT_PROVIDER.md): command 환경, schema와 실패 의미
+- [UpAgent provider 계약](docs/PROVIDER_CONTRACT.md): one-shot JSONL, 모델·이미지 출력과 실패 의미
 - [검증](docs/VERIFICATION.md): 로컬·runtime·실계정 검증 명령과 현재 증거
 - [배포](docs/RELEASE.md): GitHub와 crates.io gate
 - [보안](SECURITY.md): 지원 경계와 credential 취급

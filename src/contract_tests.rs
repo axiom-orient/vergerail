@@ -588,6 +588,86 @@ async fn complete_contract_uses_real_process_and_bidirectional_rpc() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_output_schema_and_extended_reasoning_reach_turn_start() {
+    let package_directory = tempfile::tempdir().expect("package tempdir");
+    let home_directory = tempfile::tempdir().expect("home tempdir");
+    let project_directory = tempfile::tempdir().expect("project tempdir");
+    let schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text"],
+        "properties": {"text": {"type": "string"}}
+    });
+    let script = SCRIPT.replace(
+        "assert message[\"params\"][\"effort\"] == \"medium\"",
+        concat!(
+            "assert message[\"params\"][\"effort\"] in [\"xhigh\", \"max\"]\n",
+            "        assert message[\"params\"][\"outputSchema\"] == {",
+            "\"type\":\"object\",\"additionalProperties\":False,",
+            "\"required\":[\"text\"],\"properties\":{\"text\":{\"type\":\"string\"}}}"
+        ),
+    );
+    assert_ne!(script, SCRIPT, "turn/start assertion must be active");
+    let package = create_fake_package(package_directory.path(), &script);
+    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+        .await
+        .expect("connect");
+
+    for effort in [ReasoningEffort::XHigh, ReasoningEffort::Max] {
+        let result = codex
+            .run(
+                "return structured output",
+                SessionOptions::read_only(project_directory.path())
+                    .with_reasoning(effort)
+                    .with_output_schema(schema.clone()),
+            )
+            .await
+            .expect("structured turn");
+        assert_eq!(result.status, TurnStatus::Completed);
+    }
+    codex.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_only_thread_enables_no_other_capability() {
+    let package_directory = tempfile::tempdir().expect("package tempdir");
+    let home_directory = tempfile::tempdir().expect("home tempdir");
+    let project_directory = tempfile::tempdir().expect("project tempdir");
+    let script = SCRIPT.replace(
+        "elif method == \"thread/start\":",
+        concat!(
+            "elif method == \"thread/start\":\n",
+            "        config = message[\"params\"][\"config\"]\n",
+            "        assert config[\"features\"][\"image_generation\"] is True\n",
+            "        assert config[\"features\"][\"shell_tool\"] is False\n",
+            "        assert config[\"features\"][\"unified_exec\"] is False\n",
+            "        assert config[\"web_search\"] == \"disabled\"\n",
+            "        assert config[\"history\"][\"persistence\"] == \"none\""
+        ),
+    );
+    assert_ne!(
+        script, SCRIPT,
+        "thread/start capability assertion must be active"
+    );
+    let package = create_fake_package(package_directory.path(), &script);
+    let codex = Codex::connect(
+        CodexConfig::new(package, home_directory.path()).with_image_generation(true),
+    )
+    .await
+    .expect("connect");
+    let session = codex
+        .session(
+            SessionOptions::read_only(project_directory.path())
+                .image_only()
+                .ephemeral(),
+        )
+        .await
+        .expect("image-only session");
+    session.close().await.expect("close");
+    codex.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn image_generation_session_sends_low_reasoning_effort() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
     let home_directory = tempfile::tempdir().expect("home tempdir");

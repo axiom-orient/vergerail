@@ -15,6 +15,8 @@ app-server는 인터넷에 공개하는 daemon이 아닙니다. Vergerail이 프
 
 `src/bin/ifsc_text_provider.rs`는 library 위에 놓인 bounded adapter입니다. stdin JSON을 검증한 뒤 text-only read-only session 하나를 실행하고, live event와 durable audit을 모두 검사한 정적 `ScreenProgram`만 stdout JSON으로 반환합니다. runtime·home·process·session 상태를 별도로 소유하지 않고 아래 library owner를 사용합니다.
 
+`src/bin/vergerail_provider.rs`도 같은 library 위의 one-shot adapter이며 UpAgent가 소유한 `vergerail.provider/1` process boundary를 구현합니다. 모델 경로는 native output schema와 text-only read-only session, 이미지 경로는 image-generation 하나만 켠 persistent read-only session과 durable audit을 사용합니다. provider는 재시도·credential 읽기·workspace 쓰기를 소유하지 않습니다.
+
 ## 누가 무엇을 소유하는가
 
 Codex app-server가 소유하는 것:
@@ -58,6 +60,7 @@ Vergerail은 `auth.json`, Chrome cookie, 브라우저 profile, access token을 �
 | `config/home.rs` | managed-home marker/lock, project set, atomic config/state commit |
 | `approval.rs` / `approval/protocol.rs` / `approval/respond.rs` | 공개 decision, pinned provider JSON decoding, fail-closed response I/O |
 | `bin/ifsc_text_provider.rs` | IFSC request/output validation, one-shot orchestration, typed JSON process boundary |
+| `bin/vergerail_provider.rs` | UpAgent model/image request validation, native capability restriction, one-shot JSONL response와 cleanup |
 
 `runtime/pinned-macos-aarch64.json`이 실행 경로가 읽는 runtime identity·download metadata의 단일 source of truth입니다. managed cache 경로와 installation lock 이름은 그 lock의 version·target에서 함께 유도합니다. package manifest의 `resourcesDir`와 `pathDir`는 실제 process 경계가 사용하는 `codex-resources`와 `codex-path`에 정확히 일치해야 합니다.
 
