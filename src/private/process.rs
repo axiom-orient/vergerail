@@ -155,6 +155,8 @@ impl ProcessHandle {
         };
         let mut command = process_tree::command(&guardian_path, &runtime.entrypoint);
         command
+            .arg("-c")
+            .arg("mcp_servers={}")
             .arg("app-server")
             .arg("--listen")
             .arg("stdio://")

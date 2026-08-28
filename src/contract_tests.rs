@@ -589,6 +589,35 @@ async fn complete_contract_uses_real_process_and_bidirectional_rpc() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inherited_codex_home_is_removed_before_app_server_spawn() {
+    const CHILD_MARKER: &str = "VERGERAIL_AUTH_ENV_REMOVAL_CHILD";
+
+    if std::env::var_os(CHILD_MARKER).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("contract_tests::inherited_codex_home_is_removed_before_app_server_spawn")
+            .arg("--test-threads=1")
+            .env(CHILD_MARKER, "1")
+            .env("CODEX_HOME", "/vergerail-test-sentinel")
+            .status()
+            .expect("isolated contract subprocess");
+        assert!(status.success(), "isolated contract subprocess failed");
+        return;
+    }
+
+    assert_eq!(
+        std::env::var("CODEX_HOME").as_deref(),
+        Ok("/vergerail-test-sentinel")
+    );
+    let package_directory = tempfile::tempdir().expect("package tempdir");
+    let package = create_fake_package(package_directory.path(), SCRIPT);
+    let codex = Codex::connect(CodexConfig::new(package))
+        .await
+        .expect("child CODEX_HOME must be removed");
+    codex.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_output_schema_and_extended_reasoning_reach_turn_start() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
