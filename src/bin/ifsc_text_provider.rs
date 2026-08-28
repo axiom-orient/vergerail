@@ -879,9 +879,12 @@ fn is_allowed_provider_diagnostic(diagnostic: &vergerail::Diagnostic) -> bool {
             .message
             .starts_with("discarded 'thread/tokenUsage/updated'"))
         || (diagnostic.method == "rpc/unroutedNotification"
-            && diagnostic
+            && (diagnostic
                 .message
                 .starts_with("'thread/tokenUsage/updated' targeted inactive thread '")
+                || diagnostic
+                    .message
+                    .starts_with("'mcpServer/startupStatus/updated' targeted inactive thread '"))
             && diagnostic.message.ends_with('\''))
 }
 
@@ -1748,6 +1751,15 @@ mod tests {
         assert!(is_allowed_provider_diagnostic(&vergerail::Diagnostic {
             method: "rpc/staleTurnNotification".to_owned(),
             message: "discarded 'thread/tokenUsage/updated' for a completed turn".to_owned(),
+        }));
+        assert!(is_allowed_provider_diagnostic(&vergerail::Diagnostic {
+            method: "rpc/unroutedNotification".to_owned(),
+            message: "'mcpServer/startupStatus/updated' targeted inactive thread 'thread-1'"
+                .to_owned(),
+        }));
+        assert!(!is_allowed_provider_diagnostic(&vergerail::Diagnostic {
+            method: "rpc/unroutedNotification".to_owned(),
+            message: "'item/completed' targeted inactive thread 'thread-1'".to_owned(),
         }));
         assert!(!is_allowed_provider_diagnostic(&vergerail::Diagnostic {
             method: "rpc/unsupportedServerRequest".to_owned(),

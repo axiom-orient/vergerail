@@ -1475,9 +1475,12 @@ fn is_allowed_live_diagnostic(diagnostic: &vergerail::Diagnostic) -> bool {
             .message
             .starts_with("discarded 'thread/tokenUsage/updated'"))
         || (diagnostic.method == "rpc/unroutedNotification"
-            && diagnostic
+            && (diagnostic
                 .message
                 .starts_with("'thread/tokenUsage/updated' targeted inactive thread '")
+                || diagnostic
+                    .message
+                    .starts_with("'mcpServer/startupStatus/updated' targeted inactive thread '"))
             && diagnostic.message.ends_with('\''))
 }
 
@@ -1878,6 +1881,11 @@ mod tests {
         assert!(super::is_allowed_live_diagnostic(&Diagnostic {
             method: "rpc/unroutedNotification".to_owned(),
             message: "'thread/tokenUsage/updated' targeted inactive thread 'thread-1'".to_owned(),
+        }));
+        assert!(super::is_allowed_live_diagnostic(&Diagnostic {
+            method: "rpc/unroutedNotification".to_owned(),
+            message: "'mcpServer/startupStatus/updated' targeted inactive thread 'thread-1'"
+                .to_owned(),
         }));
         assert!(!super::is_allowed_live_diagnostic(&Diagnostic {
             method: "rpc/unsupportedServerRequest".to_owned(),

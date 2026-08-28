@@ -72,9 +72,9 @@ fi
 cargo fmt --all -- --check
 cargo check --offline --locked --all-targets
 # Guardian-backed contract tests start real macOS process boundaries. Keep the
-# test harness bounded so the 500 ms request-timeout fixtures measure protocol
-# behavior rather than an unbounded process-start storm.
-cargo test --offline --locked --all-targets -- --test-threads=2
+# test harness serial so the 500 ms request-timeout fixtures measure protocol
+# behavior rather than competing with another real process boundary.
+cargo test --offline --locked --all-targets -- --test-threads=1
 cargo test --offline --locked --doc
 cargo clippy --offline --locked --all-targets -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --offline --locked --no-deps
