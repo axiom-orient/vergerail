@@ -99,13 +99,14 @@ E2E는 sandbox 검증용 임시 root와 생성 래스터용 임시 directory만 
 ## 현재 실행 증거
 
 2026-08-28 Apple silicon macOS, Rust `1.97.1`, Codex `0.150.1` 공식
-`aarch64-apple-darwin` package에서 다음을 확인했습니다.
+`aarch64-apple-darwin` package에서 아래 증거를 수집했습니다. 이 authenticated
+receipt는 `vergerail.provider/1` 통합 전 0.150.1/image 후보의 역사적 증거이며,
+현재 `main`의 release 증거로 재사용하지 않습니다. 현재 clean committed
+`HEAD`에서 full release gate를 다시 실행해야 합니다.
 
 - source identity: canonical 공개 repository와 이 local candidate를 대상으로
   검증했습니다. 이 문서는 commit SHA를 self-reference하지 않으며, release
   receipt가 clean committed `HEAD`의 full SHA를 별도로 기록해야 합니다.
-  현재 candidate는 local에만 있고 `origin/main`은 `0601e9e`로 유지되며,
-  remote branch push나 삭제는 하지 않았습니다.
 
 - protocol source archive와 raw/canonical schema의 byte 수와 SHA-256를 독립적으로
   다시 계산했고 provenance checksum 검사를 통과했습니다.
@@ -153,10 +154,9 @@ E2E는 sandbox 검증용 임시 root와 생성 래스터용 임시 directory만 
   정상 argv 실행을 확인했습니다. normal/CFLAGS/CPPFLAGS/CC(extra args) 4개
   isolated build가 모두 같은 bytes/SHA를 냈고, production helper의 legacy
   문자열·심볼은 모두 부재했습니다.
-- non-authenticated candidate gate와 authenticated image/full E2E 및 release
-  verification은 모두 완료됐습니다. 이 문서는 remote push나 branch 삭제를
-  승인하지 않으며, 최종 배포 전 independent review와 full-SHA consumer 검증이
-  남아 있습니다.
+- 이 역사적 후보의 non-authenticated gate와 authenticated image/full E2E 및
+  release verification은 모두 완료됐습니다. 현재 `main`은 추가 provider
+  계약과 통합 해석을 포함하므로 별도의 새 release receipt가 필요합니다.
 
 이 증거는 receipt 수집 시점의 local source, 공개 GitHub source와 고정 runtime
 실사용을 지지합니다. crates.io package 배포 증거는 아니며, 각 release commit의

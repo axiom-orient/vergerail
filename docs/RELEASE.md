@@ -6,18 +6,18 @@ Vergerail `0.2.0`은 Codex `0.150.1`과 Apple silicon macOS만 지원합니다. 
 
 | 경로 | 판정 | 남은 조건 |
 |---|---|---|
-| local path dependency | `GO` | 없음 |
+| local path dependency | `NEEDS_REVERIFY` | 현재 `main`의 full release gate와 independent review |
 | GitHub git dependency | `NOT RELEASED` | local candidate review, push 후 consumer full commit SHA 검증 |
 | crates.io | `OUT OF SCOPE` | `publish = false`; 별도 게시 결정과 gate가 필요 |
 
 현재 canonical source는 공개 저장소
-`https://github.com/axiom-orient/vergerail`입니다. 0.150.1/image candidate는
-local `main`에서만 준비 중이고 `origin/main`은 `0601e9e`로 유지됩니다.
-remote release branch도 아직 삭제하지 않았습니다. clean committed `HEAD`에서
-non-authenticated gate, dedicated-home authenticated image/full E2E와
-`scripts/release-verify.sh`가 모두 성공했습니다. 따라서 local path candidate는
-GO이며, push와 별도 consumer의 검증된 full commit SHA 고정은 independent review
-뒤에 진행합니다.
+`https://github.com/axiom-orient/vergerail`입니다. 현재 `main`은 Codex 0.150.1
+image 경로와 `vergerail.provider/1` provider 계약을 함께 포함합니다.
+이 통합 후보에서 non-authenticated `scripts/verify.sh`는 통과했지만,
+dedicated-home authenticated image/full E2E와 `scripts/release-verify.sh`는
+현재 clean committed `HEAD`에서 다시 실행해야 합니다. push와 별도
+consumer의 검증된 full commit SHA 고정은 그 검증과 independent review 뒤에
+진행합니다.
 
 `Cargo.toml`의 repository, homepage와 documentation URL은 canonical GitHub
 source를 가리킵니다. 현재는 crates.io 게시를 하지 않으며, tag와 release도
@@ -42,9 +42,9 @@ managed runtime download/reuse, authenticated live E2E를 직접 실행하고 �
 checkout에서는 이 release entrypoint가 전제조건 오류로 종료하며, clean committed
 `HEAD`에서는 위 external suite와 final package 검증을 수행합니다.
 
-현재 release 결정은 local candidate에 대해 `GO`, GitHub 배포에 대해
-`NEEDS_REVIEW`입니다. remote push, release branch 삭제와 배포는 independent
-review 및 full-SHA consumer 검증 전에는 수행하지 않습니다.
+현재 release 결정은 local candidate와 GitHub 배포 모두 `NEEDS_REVERIFY`입니다.
+remote push, release branch 삭제와 배포는 현재 `HEAD`의 full release gate,
+independent review 및 full-SHA consumer 검증 전에는 수행하지 않습니다.
 
 ## GitHub source
 
