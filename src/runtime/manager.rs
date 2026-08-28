@@ -147,6 +147,7 @@ impl RuntimeResolver {
     /// Resolves and fully verifies a runtime, installing the pinned package when allowed.
     pub async fn resolve(self) -> Result<ResolvedRuntime> {
         let pinned = PinnedRuntime::load()?;
+        super::verify_host_target(pinned.lock().target())?;
         let runtime_lock = pinned.lock().clone();
 
         if let Some(root) = self.explicit_root {
@@ -705,6 +706,7 @@ mod tests {
     use flate2::Compression;
     use flate2::write::GzEncoder;
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[tokio::test]
     async fn never_policy_reports_missing_runtime_without_network() {
         let cache = tempfile::tempdir().expect("cache");
@@ -718,7 +720,7 @@ mod tests {
         assert_eq!(error.operation(), "runtime.resolve");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[tokio::test]
     async fn resolver_rejects_a_symlink_cache_root_without_changing_its_target() {
         use std::os::unix::fs::symlink;
@@ -748,6 +750,27 @@ mod tests {
                 .mode()
                 & 0o777,
             0o755
+        );
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[tokio::test]
+    async fn unsupported_host_fails_before_creating_or_inspecting_the_cache() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let cache = directory.path().join("must-not-be-created");
+
+        let error = RuntimeResolver::new()
+            .with_system_discovery(false)
+            .with_cache_root(&cache)
+            .resolve()
+            .await
+            .expect_err("unsupported host must fail before runtime resolution");
+
+        assert_eq!(error.kind(), ErrorKind::RuntimeVerification);
+        assert_eq!(error.operation(), "runtime.target");
+        assert!(
+            !cache.exists(),
+            "unsupported resolution created its cache root"
         );
     }
 

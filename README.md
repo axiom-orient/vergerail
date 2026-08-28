@@ -4,7 +4,7 @@
 
 Vergerail은 Rust 애플리케이션에서 고정된 OpenAI Codex app-server를 로컬 자식 프로세스로 사용하는 라이브러리입니다. 검증된 runtime을 stdio JSONL로 연결하며, 범용 provider SDK·HTTP client·공개 daemon은 아닙니다. 저장소에는 정적 IFSC `ScreenProgram`용 `ifsc_text_provider`와 UpAgent의 `vergerail.provider/1` 계약을 제공하는 `vergerail_provider` one-shot binary도 있습니다.
 
-현재 checkout은 Apple silicon macOS, Codex `0.150.1`, Rust `1.97.1` 이상을 지원합니다. 이 프로젝트는 공개 GitHub source로 배포하며, `publish = false` 설정으로 crates.io에는 게시하지 않습니다. 상세 증거와 배포 조건은 [검증](docs/VERIFICATION.md)과 [배포](docs/RELEASE.md) 문서가 관리합니다.
+현재 checkout은 Apple silicon macOS에서 Codex `0.150.1`, Rust `1.97.1` 이상을 지원합니다. aarch64 Linux에서는 library와 `ifsc_text_provider`를 build·test·install하고 runtime에 접근하지 않는 typed input/error 경로를 실행할 수 있지만, 고정 runtime과 guardian은 macOS 전용이므로 `RuntimeResolver`/`Codex` 실행 지원을 뜻하지 않습니다. 이 프로젝트는 공개 GitHub source로 배포하며, `publish = false` 설정으로 crates.io에는 게시하지 않습니다. 상세 증거와 배포 조건은 [검증](docs/VERIFICATION.md)과 [배포](docs/RELEASE.md) 문서가 관리합니다.
 
 ## 저장소 계약
 

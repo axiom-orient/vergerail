@@ -42,10 +42,10 @@ pub(crate) fn extract_guardian(directory: &Path) -> io::Result<PathBuf> {
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {
         let _ = directory;
-        return Err(io::Error::new(
+        Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "the guardian runtime is supported only on aarch64 macOS",
-        ));
+        ))
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -214,16 +214,21 @@ fn hash_bytes(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use super::*;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use std::fs;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use std::panic::AssertUnwindSafe;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use std::process::{Child as HostChild, ExitStatus};
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use std::process::{Command as HostCommand, Stdio};
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use std::sync::{Arc, Mutex};
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use std::time::{Duration, Instant};
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use tokio::time::timeout;
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

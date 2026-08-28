@@ -39,5 +39,5 @@ pub use runtime::{
 };
 pub use session::{ReasoningEffort, Run, Sandbox, Session, SessionOptions};
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod contract_tests;

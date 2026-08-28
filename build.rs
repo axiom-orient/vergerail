@@ -29,10 +29,15 @@ fn main() {
     // The guardian is a security boundary.  Do not inherit CFLAGS, CPPFLAGS,
     // or compiler extra arguments from the caller's environment: an injected
     // define or linker flag must not change the embedded production helper.
-    // /usr/bin/clang is the supported macOS toolchain used for this artifact.
-    const CLANG: &str = "/usr/bin/clang";
+    // /usr/bin/clang remains the supported macOS toolchain. Other targets only
+    // build the target-neutral unsupported stub with the platform C compiler.
+    let compiler = if target_os == "macos" {
+        "/usr/bin/clang"
+    } else {
+        "cc"
+    };
 
-    let mut compile = Command::new(CLANG);
+    let mut compile = Command::new(compiler);
     compile
         .args([
             "-std=c11",
@@ -51,16 +56,16 @@ fn main() {
         compile.arg(format!("--target={target}"));
         compile.arg("-mmacosx-version-min=26.5");
     }
-    run(&mut compile, "compile macOS guardian");
+    run(&mut compile, "compile guardian helper");
 
-    let mut link = Command::new(CLANG);
+    let mut link = Command::new(compiler);
     link.args(["-O2", "-ffunction-sections", "-fdata-sections", "-fPIC"]);
     if let Some(target) = clang_target {
         link.arg(format!("--target={target}"));
         link.arg("-mmacosx-version-min=26.5");
     }
     link.arg(&object).arg("-o").arg(&binary);
-    run(&mut link, "link macOS guardian");
+    run(&mut link, "link guardian helper");
 
     if supported_target {
         let mut strip = Command::new("strip");

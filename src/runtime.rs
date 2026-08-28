@@ -466,11 +466,11 @@ async fn verify_version_with_timeout(
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {
         let _ = (entrypoint, version, version_timeout);
-        return Err(Error::new(
+        Err(Error::new(
             ErrorKind::RuntimeVerification,
             "runtime.version",
             "the guardian runtime is supported only on aarch64 macOS",
-        ));
+        ))
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -890,6 +890,7 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
     const TEST_SCRIPT: &str = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-cli 0.test'; exit 0; fi\nexit 0\n";
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     const HANG_SCRIPT: &str = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then sleep 5; fi\n";
 
     #[test]
@@ -1085,6 +1086,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[tokio::test]
     async fn version_timeout_terminates_hanging_process() {
         let directory = tempfile::tempdir().expect("tempdir");

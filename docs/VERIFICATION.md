@@ -20,6 +20,20 @@ scripts/verify.sh
 
 첫 ignored test는 package 전체 검증, 빈 임시 home의 handshake, signed-out 계정과 정상 종료·재사용을 검사합니다. 둘째 ignored test는 IFSC binary의 signed-out typed failure를 검사합니다.
 
+## aarch64 Linux build와 offline process smoke
+
+Linux에서는 macOS guardian process fixture를 실행하지 않습니다. 대신 target-neutral unit/integration test와 IFSC의 runtime 접근 전 typed failure 경로를 검증할 수 있습니다.
+
+```bash
+cargo build --locked
+cargo test --locked --all-targets -- --test-threads=2
+cargo test --locked --doc
+cargo install --path . --root ./target/linux-install --locked
+./target/linux-install/bin/ifsc_text_provider </dev/null
+```
+
+마지막 command의 기대 결과는 exit `2`, stdout의 `invalid-request` JSON 한 값, 빈 stderr입니다. 이 smoke는 Linux process가 실제로 설치·시작되고 stdin/stdout 계약을 지킨다는 증거일 뿐입니다. `runtime/pinned-macos-aarch64.json`과 guardian 지원 경계는 그대로이므로 Linux에서 Codex app-server 연결·command 실행이 가능하다는 증거가 아닙니다. 검증 후에는 `scripts/clean.sh`로 repository-local artifact를 제거합니다.
+
 ## 관리형 runtime
 
 다음 test는 고정 archive를 격리 cache에 다운로드해 검증·설치·연결하고 `DownloadPolicy::Never` 재사용까지 확인합니다.
