@@ -2,12 +2,14 @@
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::runtime::RuntimePackage;
+use std::path::{Component, PathBuf};
 use std::time::Duration;
 
 /// Complete configuration required to connect to a pinned app-server runtime.
 #[derive(Clone, Debug)]
 pub struct CodexConfig {
     pub(crate) runtime: RuntimePackage,
+    pub(crate) codex_home: Option<PathBuf>,
     pub(crate) client_name: String,
     pub(crate) client_title: String,
     pub(crate) request_timeout: Duration,
@@ -22,11 +24,12 @@ pub struct CodexConfig {
 }
 
 impl CodexConfig {
-    /// Creates a configuration that reuses the standard Codex account in `~/.codex`.
+    /// Creates a configuration that reuses the standard Codex account home.
     #[must_use]
     pub fn new(runtime: RuntimePackage) -> Self {
         Self {
             runtime,
+            codex_home: None,
             client_name: "vergerail".to_owned(),
             client_title: "Vergerail".to_owned(),
             request_timeout: Duration::from_secs(30),
@@ -39,6 +42,28 @@ impl CodexConfig {
             stderr_capacity: 64 * 1024,
             image_generation: false,
         }
+    }
+
+    /// Uses the explicitly selected Codex account state for the child
+    /// app-server process. The directory is never created or copied by
+    /// Vergerail; callers must provision and authenticate it separately.
+    pub fn with_codex_home(mut self, home: impl Into<PathBuf>) -> Result<Self> {
+        let home = home.into();
+        if !home.is_absolute()
+            || home.as_os_str().is_empty()
+            || home.to_string_lossy().contains('\0')
+            || home
+                .components()
+                .any(|component| component == Component::ParentDir)
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "CodexConfig::with_codex_home",
+                "Codex home must be an absolute path without parent traversal",
+            ));
+        }
+        self.codex_home = Some(home);
+        Ok(self)
     }
 
     /// Sets the client title reported during the initialize handshake.
@@ -200,6 +225,27 @@ mod tests {
         assert_eq!(
             config.validate().expect_err("zero event capacity").kind(),
             ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn codex_home_override_requires_a_clean_absolute_path() {
+        let config = config_for_validation()
+            .with_codex_home("/tmp/vergerail-managed-home")
+            .expect("absolute managed home");
+        assert_eq!(
+            config.codex_home.as_deref(),
+            Some(std::path::Path::new("/tmp/vergerail-managed-home"))
+        );
+        assert!(
+            config_for_validation()
+                .with_codex_home("relative-home")
+                .is_err()
+        );
+        assert!(
+            config_for_validation()
+                .with_codex_home("/tmp/../outside")
+                .is_err()
         );
     }
 }

@@ -6,6 +6,10 @@ use crate::account::{Account, Login, LoginMethod, LoginRegistry, LoginWait};
 use crate::config::CodexConfig;
 use crate::error::{Error, ErrorKind, Result};
 use crate::event::{Diagnostic, DiagnosticBuffer, RunResult, TurnAudit};
+use crate::image::{
+    ChatGptImageAuth, DirectImageRequest, DirectImageResponse, ImageEndpointError,
+    generate_via_endpoint,
+};
 use crate::model::Model;
 use crate::private::connection::ConnectionLifecycle;
 use crate::private::process::ProcessHandle;
@@ -23,9 +27,11 @@ use crate::session::{
 };
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::Instant;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
@@ -37,6 +43,7 @@ pub struct Codex {
 pub(crate) struct ClientInner {
     config: CodexConfig,
     process: ProcessHandle,
+    image_endpoint: Mutex<String>,
     requests: RequestRegistry,
     runs: RunRegistry,
     sessions: SessionRegistry,
@@ -208,6 +215,7 @@ impl Codex {
         let inner = Arc::new(ClientInner {
             config,
             process,
+            image_endpoint: Mutex::new(crate::image::CHATGPT_IMAGE_GENERATION_ENDPOINT.to_owned()),
             requests: RequestRegistry::new(),
             runs: RunRegistry::new(),
             sessions: SessionRegistry::new(),
@@ -249,6 +257,22 @@ impl Codex {
     /// Returns all models visible to the current account.
     pub async fn models(&self) -> Result<Vec<Model>> {
         self.inner.models().await
+    }
+
+    /// Generates exactly one validated PNG using authentication exported by
+    /// the official app-server. The image endpoint is retried once only after
+    /// that endpoint explicitly returns HTTP 401.
+    pub async fn generate_image(&self, request: DirectImageRequest) -> Result<DirectImageResponse> {
+        self.inner.generate_image(request).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_image_endpoint_for_test(&mut self, endpoint: impl Into<String>) {
+        *self
+            .inner
+            .image_endpoint
+            .lock()
+            .expect("test image endpoint lock") = endpoint.into();
     }
 
     /// Creates a new Codex session.
@@ -328,6 +352,15 @@ impl Codex {
                 format!("shutdown task failed: {error}"),
             )
         })?
+    }
+}
+
+fn remaining_timeout(deadline: Instant) -> std::time::Duration {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        std::time::Duration::from_millis(1)
+    } else {
+        remaining
     }
 }
 
@@ -618,6 +651,64 @@ impl ClientInner {
             "model.list",
             "model catalog exceeded 1000 pages",
         ))
+    }
+
+    async fn generate_image(
+        self: &Arc<Self>,
+        request: DirectImageRequest,
+    ) -> Result<DirectImageResponse> {
+        if request.prompt.trim().is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "image.generate",
+                "image prompt must be non-empty",
+            ));
+        }
+        if request.prompt.len() > 128 * 1024 || request.prompt.contains('\0') {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "image.generate",
+                "image prompt exceeds the bounded UTF-8 limit",
+            ));
+        }
+        let deadline = Instant::now() + self.config.request_timeout;
+        let image_endpoint = self
+            .image_endpoint
+            .lock()
+            .expect("image endpoint lock")
+            .clone();
+        generate_image_with_retry(
+            request,
+            deadline,
+            |refresh, request_timeout| self.image_auth(refresh, request_timeout),
+            |auth, request, request_timeout, turn_id| {
+                generate_via_endpoint(
+                    image_endpoint.clone(),
+                    auth,
+                    request,
+                    request_timeout,
+                    turn_id,
+                )
+            },
+        )
+        .await
+    }
+
+    async fn image_auth(
+        self: &Arc<Self>,
+        refresh: bool,
+        request_timeout: std::time::Duration,
+    ) -> Result<ChatGptImageAuth> {
+        let response = self
+            .request_with_timeout(
+                "getAuthStatus",
+                json!({"includeToken": true, "refreshToken": refresh}),
+                false,
+                "image.auth",
+                request_timeout,
+            )
+            .await?;
+        ChatGptImageAuth::from_auth_status(&response)
     }
 
     pub(crate) async fn create_session(
@@ -1301,6 +1392,25 @@ impl ClientInner {
             .await
     }
 
+    async fn request_with_timeout(
+        self: &Arc<Self>,
+        method: &'static str,
+        params: Value,
+        non_idempotent: bool,
+        operation: &'static str,
+        request_timeout: std::time::Duration,
+    ) -> Result<Value> {
+        self.request_internal_with_timeout(
+            method,
+            params,
+            non_idempotent,
+            operation,
+            false,
+            request_timeout,
+        )
+        .await
+    }
+
     async fn request_internal(
         self: &Arc<Self>,
         method: &'static str,
@@ -1308,6 +1418,26 @@ impl ClientInner {
         non_idempotent: bool,
         operation: &'static str,
         allow_closing: bool,
+    ) -> Result<Value> {
+        self.request_internal_with_timeout(
+            method,
+            params,
+            non_idempotent,
+            operation,
+            allow_closing,
+            self.config.request_timeout,
+        )
+        .await
+    }
+
+    async fn request_internal_with_timeout(
+        self: &Arc<Self>,
+        method: &'static str,
+        params: Value,
+        non_idempotent: bool,
+        operation: &'static str,
+        allow_closing: bool,
+        request_timeout: std::time::Duration,
     ) -> Result<Value> {
         if self.connection.is_closing() && !allow_closing {
             return Err(Error::new(
@@ -1360,7 +1490,7 @@ impl ClientInner {
                 );
             }
 
-            match timeout(self.config.request_timeout, receiver).await {
+            match timeout(request_timeout, receiver).await {
                 Ok(Ok(result)) => {
                     ownership_resolved = true;
                     result
@@ -1378,7 +1508,7 @@ impl ClientInner {
                                 operation,
                                 format!(
                                     "request was written but no response arrived within {} ms; the runtime was killed and the request was not retried",
-                                    self.config.request_timeout.as_millis()
+                                    request_timeout.as_millis()
                                 ),
                             );
                             // Mark the client disconnected before terminating the child. Otherwise
@@ -1388,7 +1518,7 @@ impl ClientInner {
                             Err(outcome)
                         }
                         TimeoutDisposition::TimedOut => {
-                            Err(Error::timeout(operation, self.config.request_timeout))
+                            Err(Error::timeout(operation, request_timeout))
                         }
                     }
                 }
@@ -1533,6 +1663,46 @@ impl ClientInner {
         self.runs.fail_all(&error);
 
         self.logins.fail_active(&error);
+    }
+}
+
+async fn generate_image_with_retry<AuthFactory, AuthFuture, EndpointFactory, EndpointFuture>(
+    request: DirectImageRequest,
+    deadline: Instant,
+    mut auth_factory: AuthFactory,
+    mut endpoint_factory: EndpointFactory,
+) -> Result<DirectImageResponse>
+where
+    AuthFactory: FnMut(bool, std::time::Duration) -> AuthFuture,
+    AuthFuture: Future<Output = Result<ChatGptImageAuth>>,
+    EndpointFactory:
+        FnMut(ChatGptImageAuth, DirectImageRequest, std::time::Duration, String) -> EndpointFuture,
+    EndpointFuture: Future<Output = std::result::Result<DirectImageResponse, ImageEndpointError>>,
+{
+    let turn_id = crate::image::image_turn_id();
+    let auth = auth_factory(true, remaining_timeout(deadline)).await?;
+    match endpoint_factory(
+        auth,
+        request.clone(),
+        remaining_timeout(deadline),
+        turn_id.clone(),
+    )
+    .await
+    {
+        Ok(response) => Ok(response),
+        Err(ImageEndpointError::Unauthorized) => {
+            let refreshed = auth_factory(true, remaining_timeout(deadline)).await?;
+            match endpoint_factory(refreshed, request, remaining_timeout(deadline), turn_id).await {
+                Ok(response) => Ok(response),
+                Err(ImageEndpointError::Unauthorized) => Err(Error::new(
+                    ErrorKind::Authentication,
+                    "image.generate",
+                    "official image endpoint rejected refreshed authentication",
+                )),
+                Err(ImageEndpointError::Failed(error)) => Err(error),
+            }
+        }
+        Err(ImageEndpointError::Failed(error)) => Err(error),
     }
 }
 
@@ -1688,6 +1858,64 @@ mod waiter_guard_tests {
             config.pointer("/memories/use_memories"),
             Some(&json!(false))
         );
+    }
+
+    #[tokio::test]
+    async fn image_retry_orchestration_refreshes_auth_once_and_reuses_turn_id() {
+        let auth_calls = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let endpoint_calls = Arc::new(Mutex::new(Vec::<(String, std::time::Duration)>::new()));
+        let auth_calls_for_factory = Arc::clone(&auth_calls);
+        let auth_factory = move |refresh: bool, request_timeout: std::time::Duration| {
+            let auth_calls = Arc::clone(&auth_calls_for_factory);
+            let _ = request_timeout;
+            auth_calls.lock().expect("auth calls lock").push(refresh);
+            let auth = ChatGptImageAuth::from_auth_status(&json!({
+                "authMethod": "chatgpt",
+                "authToken": "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoidGVzdC1hY2NvdW50In19.sig",
+                "requiresOpenaiAuth": true
+            }));
+            async move { auth }
+        };
+        let endpoint_calls_for_factory = Arc::clone(&endpoint_calls);
+        let endpoint_factory = move |_auth: ChatGptImageAuth,
+                                     _request: DirectImageRequest,
+                                     request_timeout: std::time::Duration,
+                                     turn_id: String| {
+            let mut calls = endpoint_calls_for_factory
+                .lock()
+                .expect("endpoint calls lock");
+            calls.push((turn_id, request_timeout));
+            let attempt = calls.len();
+            drop(calls);
+            async move {
+                assert!(attempt <= 2, "image retry must not exceed one retry");
+                Err(ImageEndpointError::Unauthorized)
+            }
+        };
+        let request = DirectImageRequest {
+            model: "gpt-image-1".to_owned(),
+            prompt: "test image".to_owned(),
+            background: crate::image::ImageBackground::Transparent,
+            size: crate::image::ImageSize::Square,
+            quality: crate::image::ImageQuality::Low,
+        };
+        let error = generate_image_with_retry(
+            request,
+            Instant::now() + std::time::Duration::from_secs(1),
+            auth_factory,
+            endpoint_factory,
+        )
+        .await
+        .expect_err("second 401 must be terminal");
+        assert_eq!(error.kind(), ErrorKind::Authentication);
+        assert_eq!(
+            *auth_calls.lock().expect("auth calls lock"),
+            vec![true, true]
+        );
+        let calls = endpoint_calls.lock().expect("endpoint calls lock");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, calls[1].0);
+        assert!(calls.iter().all(|(_, timeout)| !timeout.is_zero()));
     }
 
     #[test]

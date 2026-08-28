@@ -4,14 +4,19 @@
 
 use crate::runtime::{RuntimeArtifact, RuntimeLock, RuntimePackage};
 use crate::{
-    Account, ApprovalEvent, Codex, CodexConfig, CommandDecision, Event, LoginMethod,
-    ReasoningEffort, SessionOptions, TurnStatus,
+    Account, ApprovalEvent, Codex, CodexConfig, CommandDecision, DirectImageRequest, Event,
+    ImageBackground, ImageQuality, ImageSize, LoginMethod, ReasoningEffort, SessionOptions,
+    TurnStatus,
 };
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::fs;
+use std::io::{Read as _, Write as _};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
 const SCRIPT: &str = r###"#!/usr/bin/env python3
 import json
@@ -113,6 +118,46 @@ for raw in sys.stdin:
         send({"method": "warning", "params": {"message": "unsupported reverse request rejected"}})
     elif request_id is not None:
         send({"id": request_id, "error": {"code": -32601, "message": "unsupported fake method"}})
+"###;
+
+const IMAGE_AUTH_SCRIPT: &str = r###"#!/usr/bin/env python3
+import json
+import sys
+
+if len(sys.argv) == 2 and sys.argv[1] == "--version":
+    print("codex-cli 0.test")
+    raise SystemExit(0)
+
+def send(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+auth_count = 0
+for raw in sys.stdin:
+    message = json.loads(raw)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        send({"id": request_id, "result": {"userAgent": "image-auth-fixture"}})
+    elif method == "initialized":
+        pass
+    elif method == "getAuthStatus":
+        params = message["params"]
+        assert params["includeToken"] is True
+        assert params["refreshToken"] is True
+        auth_count += 1
+        assert auth_count <= 2
+        payload = (
+            "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoi"
+            + ("Zmlyc3QtYWNjb3VudCJ9fQ" if auth_count == 1 else "c2Vjb25kLWFjY291bnQifX0")
+        )
+        send({"id": request_id, "result": {
+            "authMethod": "chatgpt",
+            "authToken": "e30." + payload + ".fixture",
+            "requiresOpenaiAuth": True
+        }})
+    else:
+        send({"id": request_id, "error": {"code": -32601, "message": "unsupported"}})
 "###;
 
 const LOGIN_TIMEOUT_SCRIPT: &str = r###"#!/usr/bin/env python3
@@ -493,6 +538,132 @@ for raw in sys.stdin:
         send({"id": request_id, "error": {"code": -32601, "message": "unsupported"}})
 "###;
 
+fn read_image_http_request(mut stream: &TcpStream) -> Vec<u8> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set image request read timeout");
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let header_end = loop {
+        let count = stream.read(&mut buffer).expect("image request headers");
+        assert!(count > 0, "image request must contain headers");
+        bytes.extend_from_slice(&buffer[..count]);
+        if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+        assert!(
+            bytes.len() < 512 * 1024,
+            "image request headers are bounded"
+        );
+    };
+    let headers = String::from_utf8_lossy(&bytes[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Content-Length:")
+                .or_else(|| line.strip_prefix("content-length:"))
+        })
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    assert!(
+        content_length <= 256 * 1024,
+        "image request body is bounded"
+    );
+    while bytes.len() < header_end + content_length {
+        let count = stream.read(&mut buffer).expect("image request body");
+        assert!(count > 0, "image request body must complete");
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    bytes
+}
+
+fn image_http_header(request: &[u8], name: &str) -> Option<String> {
+    String::from_utf8_lossy(request).lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_owned())
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_generation_exercises_app_server_auth_refresh_and_http_retry() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("local image fixture");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking image fixture");
+    let endpoint = format!(
+        "http://{}/backend-api/codex/images/generations",
+        listener.local_addr().expect("fixture address")
+    );
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let started = std::time::Instant::now();
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            started.elapsed() < Duration::from_secs(5),
+                            "image endpoint fixture did not receive the expected retry"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("image endpoint fixture accept failed: {error}"),
+                }
+            };
+            requests.push(read_image_http_request(&stream));
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("401 response");
+        }
+        requests
+    });
+
+    let package_directory = tempfile::tempdir().expect("package tempdir");
+    let home_directory = tempfile::tempdir().expect("home tempdir");
+    let package = create_fake_package(package_directory.path(), IMAGE_AUTH_SCRIPT);
+    let config = CodexConfig::new(package)
+        .with_codex_home(home_directory.path())
+        .expect("explicit auth home")
+        .with_image_generation(true)
+        .with_request_timeout(Duration::from_secs(3));
+    let mut codex = Codex::connect(config)
+        .await
+        .expect("connect fixture app-server");
+    codex.set_image_endpoint_for_test(endpoint);
+
+    let error = codex
+        .generate_image(DirectImageRequest {
+            model: "gpt-image-1".to_owned(),
+            prompt: "fixture image".to_owned(),
+            background: ImageBackground::Transparent,
+            size: ImageSize::Square,
+            quality: ImageQuality::Low,
+        })
+        .await
+        .expect_err("second 401 must terminate the image operation");
+    assert_eq!(error.kind(), crate::ErrorKind::Authentication);
+    codex.shutdown().await.expect("shutdown fixture app-server");
+
+    let requests = server.join().expect("image endpoint fixture thread");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        image_http_header(&requests[0], "Chatgpt-Account-Id").as_deref(),
+        Some("first-account")
+    );
+    assert_eq!(
+        image_http_header(&requests[1], "Chatgpt-Account-Id").as_deref(),
+        Some("second-account")
+    );
+    let first_turn = image_http_header(&requests[0], "x-codex-image-turn-id");
+    let second_turn = image_http_header(&requests[1], "x-codex-image-turn-id");
+    assert!(first_turn.as_deref().is_some_and(|value| !value.is_empty()));
+    assert_eq!(first_turn, second_turn);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn complete_contract_uses_real_process_and_bidirectional_rpc() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
@@ -614,6 +785,31 @@ async fn inherited_codex_home_is_removed_before_app_server_spawn() {
     let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("child CODEX_HOME must be removed");
+    codex.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_codex_home_is_forwarded_to_app_server_spawn() {
+    let home_directory = tempfile::tempdir().expect("home tempdir");
+    let expected_home = serde_json::to_string(
+        home_directory
+            .path()
+            .to_str()
+            .expect("home path must be UTF-8"),
+    )
+    .expect("home JSON string");
+    let script = SCRIPT.replace(
+        "assert \"CODEX_HOME\" not in os.environ",
+        &format!("assert os.environ.get(\"CODEX_HOME\") == {expected_home}"),
+    );
+    let package_directory = tempfile::tempdir().expect("package tempdir");
+    let package = create_fake_package(package_directory.path(), &script);
+    let config = CodexConfig::new(package)
+        .with_codex_home(home_directory.path())
+        .expect("explicit home");
+    let codex = Codex::connect(config)
+        .await
+        .expect("explicit Codex home must reach the child app-server");
     codex.shutdown().await.expect("shutdown");
 }
 

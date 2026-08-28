@@ -19,13 +19,19 @@ scripts/clean.sh
 
 ```bash
 export VERGERAIL_CODEX_PACKAGE="/absolute/path/to/audited/package"
+export VERGERAIL_CODEX_HOME="/absolute/path/to/already-authenticated-codex-home"
 export VERGERAIL_MODEL="gpt-5.6-luna"
 export VERGERAIL_WORKSPACE="$PWD"
 export VERGERAIL_PERFECTPIXEL_BIN="/absolute/path/to/perfectpixel"
 scripts/verify.sh --release
 ```
 
-인증 입력은 별도 환경 변수가 아닙니다. app-server가 표준 `~/.codex`를 사용하므로 ChatGPT 앱 또는 `codex login`으로 로그인된 계정을 재사용합니다. signed-out 상태에서는 live 검증이 즉시 실패하며 검증 중 브라우저나 OAuth 흐름을 자동 시작하지 않습니다.
+인증 파일이나 token을 provider에 직접 전달하지 않습니다. `VERGERAIL_CODEX_HOME`은
+ChatGPT 앱 또는 `codex login`으로 이미 로그인된 명시적 managed home이며, app-server가
+그 상태를 읽어 auth를 export합니다. signed-out 상태에서는 live 검증이 즉시 실패하며
+검증 중 브라우저나 OAuth 흐름을 자동 시작하지 않습니다. 일반 library 사용은
+`CodexConfig::new`의 표준 home 동작을 사용하고, UpAgent provider는 재현성을 위해
+managed home을 명시해야 합니다.
 
 ## 산출물 정리
 
@@ -33,7 +39,7 @@ scripts/verify.sh --release
 scripts/clean.sh
 ```
 
-이 명령은 repository root를 확인한 뒤 `cargo clean`, `package-check/`, coverage 결과와 `.DS_Store`만 제거합니다. 표준 `~/.codex`, 사용자 credential, 외부 runtime cache, 다른 저장소는 건드리지 않습니다. 제거한 build 결과는 `cargo build --locked` 또는 `scripts/verify.sh`로 복원할 수 있습니다.
+이 명령은 repository root를 확인한 뒤 `cargo clean`, `package-check/`, coverage 결과와 `.DS_Store`만 제거합니다. app-server가 관리하는 로그인 home, 사용자 credential, 외부 runtime cache, 다른 저장소는 건드리지 않습니다. 제거한 build 결과는 `cargo build --locked` 또는 `scripts/verify.sh`로 복원할 수 있습니다.
 
 ## 프로세스 종료 증거
 

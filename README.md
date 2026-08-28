@@ -2,7 +2,7 @@
 
 > Verified runtimes. Explicit authority.
 
-Vergerail은 Rust 애플리케이션에서 고정된 OpenAI Codex app-server를 로컬 자식 프로세스로 사용하는 라이브러리입니다. 검증된 runtime을 stdio JSONL로 연결하며 범용 provider SDK, HTTP client, 공개 daemon은 아닙니다. 저장소에는 IFSC `ScreenProgram`용 `ifsc_text_provider`와 UpAgent용 `vergerail_provider` one-shot binary도 포함됩니다.
+Vergerail은 Rust 애플리케이션에서 고정된 OpenAI Codex app-server를 로컬 자식 프로세스로 사용하는 라이브러리입니다. 검증된 runtime을 stdio JSONL로 연결하며 범용 provider SDK, HTTP client, 공개 daemon은 아닙니다. 저장소에는 IFSC `ScreenProgram`용 `ifsc_text_provider`와 UpAgent용 `vergerail-upagent-provider` one-shot binary도 포함됩니다.
 
 현재 지원 조합은 Apple silicon macOS, Codex `0.150.1`, Rust `1.97.1` 이상입니다. Linux에서는 runtime을 실행하지 않는 library와 provider의 정적 경로만 build·test할 수 있습니다. `publish = false`이므로 crates.io에는 게시하지 않습니다.
 
@@ -11,7 +11,7 @@ Vergerail은 Rust 애플리케이션에서 고정된 OpenAI Codex app-server를 
 - 입력: `Cargo.toml`·`Cargo.lock`, `runtime/` lock, `protocol/` schema·provenance, provider stdin JSON, caller가 지정한 workspace
 - 출력: Rust API의 typed event/result와 provider stdout의 JSON 값 하나
 - 산출물: `target/`, `package-check/`, coverage 파일과 OS 임시 파일; 모두 `scripts/clean.sh`로 재생성 가능하게 제거
-- 외부 사용자 상태: 표준 `~/.codex` 로그인과 Vergerail runtime cache; 저장소 산출물이 아니며 clean/package 대상이 아님
+- 외부 사용자 상태: app-server가 관리하는 로그인 home과 Vergerail runtime cache; 저장소 산출물이 아니며 clean/package 대상이 아님
 
 저장소 스크립트는 두 개만 유지합니다.
 
@@ -40,7 +40,10 @@ vergerail = { git = "https://github.com/axiom-orient/vergerail.git", rev = "<ver
 
 ## 빠른 시작
 
-Vergerail은 별도 인증 저장소를 만들지 않습니다. app-server는 표준 `~/.codex`를 사용하므로 ChatGPT 앱 또는 `codex login`으로 이미 인증한 계정을 그대로 재사용합니다.
+Vergerail은 별도 인증 저장소를 만들지 않습니다. 기본 `CodexConfig`는 상속된
+`CODEX_HOME`을 제거하며, provider 경계는 반드시 명시한 managed home을
+`CODEX_HOME`으로 전달합니다. 그 디렉터리는 ChatGPT 앱 또는 `codex login`으로
+먼저 인증되어 있어야 하며 Vergerail은 credential을 복사하거나 생성하지 않습니다.
 
 ```rust,no_run
 use vergerail::{Account, Codex, CodexConfig, RuntimeResolver};
@@ -69,7 +72,15 @@ async fn main() -> vergerail::Result<()> {
 
 이미지 생성은 기본적으로 꺼져 있습니다. `CodexConfig::new(runtime).with_image_generation(true)`로 명시적으로 활성화하며 `Event::ImageGeneration`, `RunResult::image_generations`, `Session::audit_turn()`을 함께 검증합니다.
 
-`ifsc_text_provider`는 read-only text-only session에서 정적 `ScreenProgram` JSON을 반환합니다. `vergerail_provider`는 고정 runtime package, model, read-only workspace를 환경으로 받아 `model_turn` 또는 `image_generate` 한 번을 처리합니다. 두 provider 모두 표준 Codex 로그인을 재사용하며 credential 파일을 읽거나 복사하지 않습니다.
+`ifsc_text_provider`는 read-only text-only session에서 정적 `ScreenProgram` JSON을 반환합니다. `vergerail-upagent-provider`는 고정 공식 runtime package, 명시적 managed home, model, read-only workspace를 환경으로 받아 `model_turn` 또는 `image_generate` 한 번을 처리합니다. `image_generate`는 먼저 공식 app-server의 `getAuthStatus`로 갱신 가능한 인증을 받아 ChatGPT Images endpoint를 직접 호출하므로 모델의 도구 선택에 의존하지 않습니다. HTTP 401일 때만 인증을 한 번 갱신하고 한 번 재시도합니다. 유효한 PNG 한 장이면 실제 크기와 PNG의 alpha 가능 여부를 포함해 성공으로 반환합니다. 두 provider 모두 managed home의 기존 Codex 로그인을 재사용하며 credential 파일을 읽거나 복사하지 않습니다.
+
+provider 실행에는 `VERGERAIL_CODEX_HOME`도 필요합니다. 이 값은 기존 로그인 상태가
+있는 명시적 managed home이어야 합니다.
+
+이미지 배경·크기·품질은 `image_generate.imageOptions`로 지정할 수 있습니다.
+provider가 공식 app-server에서 인증만 내보내고 이미지 요청은 고정된 Images
+endpoint로 보내므로 app-server를 별도로 빌드하거나 패치할 필요가 없습니다.
+`VERGERAIL_CODEX_LOCK` 같은 사용자 제작 runtime lock은 지원하지 않습니다.
 
 ## 주요 API와 문서
 

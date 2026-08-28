@@ -21,7 +21,9 @@ cargo build --locked --release --bin ifsc_text_provider
 
 기본값은 실행 중 예기치 않은 runtime 다운로드를 하지 않습니다. 관리 cache가 없으면 검증된 package를 `VERGERAIL_CODEX_PACKAGE`로 주거나 설치를 명시적으로 `if-missing`으로 허용해야 합니다.
 
-provider는 표준 `~/.codex`의 ChatGPT 앱 또는 `codex login` 인증을 재사용합니다. signed-out이면 브라우저를 임의로 열지 않고 `authentication-required`로 실패합니다.
+provider는 app-server가 선택하는 기본 Codex home의 ChatGPT 앱 또는 `codex login`
+인증을 재사용합니다. signed-out이면 브라우저를 임의로 열지 않고
+`authentication-required`로 실패합니다.
 
 ```bash
 export VERGERAIL_MODEL=gpt-5.6-luna

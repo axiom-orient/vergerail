@@ -154,15 +154,13 @@ impl ProcessHandle {
             }
         };
         let mut command = process_tree::command(&guardian_path, &runtime.entrypoint);
+        command.arg("-c").arg("mcp_servers={}");
+        command.arg("app-server");
         command
-            .arg("-c")
-            .arg("mcp_servers={}")
-            .arg("app-server")
             .arg("--listen")
             .arg("stdio://")
             .arg("--strict-config")
             .current_dir(env::temp_dir())
-            .env_remove("CODEX_HOME")
             .env("LOG_FORMAT", "json")
             .env("NO_COLOR", "1")
             .env("TERM", "dumb")
@@ -189,6 +187,15 @@ impl ProcessHandle {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+
+        match config.codex_home.as_ref() {
+            Some(home) => {
+                command.env("CODEX_HOME", home);
+            }
+            None => {
+                command.env_remove("CODEX_HOME");
+            }
+        }
 
         let bundled_path = runtime.root.join("codex-path");
         let mut path_segments = vec![bundled_path];

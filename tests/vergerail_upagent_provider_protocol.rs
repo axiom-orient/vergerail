@@ -2,9 +2,15 @@
 
 use serde_json::{Value, json};
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
-const PROVIDER: &str = env!("CARGO_BIN_EXE_vergerail_provider");
+fn provider() -> PathBuf {
+    std::env::var_os("CARGO_BIN_EXE_vergerail-upagent-provider")
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_vergerail_upagent_provider"))
+        .map(PathBuf::from)
+        .expect("Cargo must expose the vergerail-upagent-provider test binary")
+}
 
 fn model_request(reasoning: &str, maximum_response_bytes: usize) -> Value {
     json!({
@@ -42,8 +48,9 @@ fn image_request(reasoning: &str) -> Value {
 }
 
 fn execute(value: &Value) -> Output {
-    let mut child = Command::new(PROVIDER)
+    let mut child = Command::new(provider())
         .env_remove("VERGERAIL_CODEX_PACKAGE")
+        .env_remove("VERGERAIL_CODEX_HOME")
         .env_remove("VERGERAIL_MODEL")
         .env_remove("VERGERAIL_WORKSPACE")
         .stdin(Stdio::piped())

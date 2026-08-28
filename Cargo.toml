@@ -12,6 +12,7 @@ homepage = "https://github.com/axiom-orient/vergerail"
 documentation = "https://github.com/axiom-orient/vergerail/tree/main/docs"
 keywords = ["codex", "agent", "openai", "json-rpc", "rust"]
 categories = ["api-bindings", "development-tools"]
+autobins = false
 include = [
     "build.rs",
     "src/**/*.rs",
@@ -44,6 +45,14 @@ ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
 
 [build-dependencies]
 sha2 = "0.11.0"
+
+[[bin]]
+name = "vergerail-upagent-provider"
+path = "src/bin/vergerail_upagent_provider.rs"
+
+[[bin]]
+name = "ifsc_text_provider"
+path = "src/bin/ifsc_text_provider.rs"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["process"] }

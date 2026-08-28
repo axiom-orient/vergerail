@@ -21,7 +21,7 @@ if find . -path ./.git -prune -o -name .DS_Store -type f -print | grep -q .; the
     exit 1
 fi
 
-if grep -R -n -E 'VERGERAIL_CODEX_HOME|VERGERAIL_HOME_OWNER|with_home_owner|ManagedHome' \
+if grep -R -n -E 'VERGERAIL_HOME_OWNER|with_home_owner|ManagedHome' \
     src examples tests docs README.md SECURITY.md; then
     echo "retired dedicated-home surface detected" >&2
     exit 1
@@ -53,6 +53,10 @@ if [ "$release" -eq 1 ]; then
     fi
     if [ -z "${VERGERAIL_CODEX_PACKAGE:-}" ] || [ ! -d "${VERGERAIL_CODEX_PACKAGE:-}" ]; then
         echo "release external proof requires VERGERAIL_CODEX_PACKAGE" >&2
+        exit 1
+    fi
+    if [ -z "${VERGERAIL_CODEX_HOME:-}" ] || [ ! -d "${VERGERAIL_CODEX_HOME:-}" ]; then
+        echo "release external proof requires an existing VERGERAIL_CODEX_HOME" >&2
         exit 1
     fi
     if [ -z "${VERGERAIL_MODEL:-}" ]; then

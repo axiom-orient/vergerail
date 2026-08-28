@@ -6,7 +6,21 @@ Vergerail runtime 실행은 Apple silicon macOS와 저장소에 고정된 Codex 
 
 ## 인증
 
-Vergerail은 app-server를 표준 Codex 상태에서 실행합니다. 따라서 ChatGPT 앱 또는 `codex login`이 만든 `~/.codex` 로그인을 재사용합니다. `auth.json`, browser cookie/profile, access token을 직접 읽거나 복사하거나 저장소에 기록하지 않습니다. 별도 인증-home, owner marker, 인증 마이그레이션 경로는 지원하지 않습니다.
+Vergerail은 인증 파일이나 browser cookie/profile을 직접 읽지 않습니다. 일반
+library 사용은 공식 app-server가 관리하는 기본 Codex home을 사용하고, UpAgent
+provider는 재현성을 위해 `VERGERAIL_CODEX_HOME`을 명시적으로 전달합니다. 그
+home은 ChatGPT 앱 또는 `codex login`으로 이미 로그인되어 있어야 합니다.
+
+이미지 요청에서 공식 app-server는 `getAuthStatus`의
+`includeToken=true, refreshToken=true` 결과로 short-lived access token과 JWT의
+bounded ChatGPT account claim을 신뢰된 로컬 Vergerail process에 의도적으로
+export합니다. Vergerail은 이를 메모리에서 endpoint 요청에만 사용하고 파일·로그·
+provider 응답에 저장하지 않습니다. 이 로컬 export는 credential 파일을 직접
+복사하는 방식이 아닙니다.
+
+인증 전달은 loopback MCP server나 MCP connector claim에 의존하지 않습니다.
+현재 trusted-origin gating 때문에 loopback MCP 경로의 auth propagation은
+사용할 수 없으며, 그것은 Vergerail 이미지 아키텍처의 경로가 아닙니다.
 
 `Codex::login()`은 app-server의 공식 로그인 흐름만 시작합니다. URL 열기, 계정 선택, MFA는 host와 사용자가 수행합니다. `Codex::logout()`은 공유 표준 계정에 영향을 주므로 host가 명시적으로 요청한 경우에만 호출해야 합니다.
 

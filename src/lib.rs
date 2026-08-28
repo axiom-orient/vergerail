@@ -32,7 +32,10 @@ pub use event::{
     CommandSummary, Diagnostic, Event, FileChangeSummary, OpaqueEvent, RunResult, TurnAudit,
     TurnStatus, Usage,
 };
-pub use image::{ImageGeneration, ImageGenerationFailure};
+pub use image::{
+    DirectImageRequest, DirectImageResponse, ImageBackground, ImageGeneration,
+    ImageGenerationFailure, ImageQuality, ImageSize,
+};
 pub use model::Model;
 pub use runtime::{
     DownloadPolicy, ResolvedRuntime, RuntimeOrigin, RuntimePackage, RuntimeResolver,

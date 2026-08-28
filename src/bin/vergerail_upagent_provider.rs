@@ -18,7 +18,10 @@ use std::io::{self, Read as _, Write as _};
 use std::path::Component;
 use std::path::PathBuf;
 use std::time::Duration;
-use vergerail::{Codex, CodexConfig, ReasoningEffort, RuntimePackage, SessionOptions, TurnStatus};
+use vergerail::{
+    Codex, CodexConfig, DirectImageRequest, ImageBackground, ImageQuality, ImageSize,
+    ReasoningEffort, RuntimePackage, SessionOptions, TurnStatus,
+};
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -64,6 +67,53 @@ struct ProviderRequest {
     maximum_response_bytes: usize,
     #[serde(default)]
     prompt: Option<String>,
+    #[serde(default)]
+    image_options: Option<ImageGenerationOptions>,
+}
+
+/// Explicit image controls sent by Vergerail's official image adapter.
+///
+/// The fields remain optional so omitted controls use the runtime defaults.
+/// When a field is present, it is sent as an exact value to the official Images
+/// endpoint; no prompt-based fallback is used.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ImageGenerationOptions {
+    #[serde(default)]
+    background: Option<ImageBackgroundOption>,
+    #[serde(default)]
+    size: Option<ImageSizeOption>,
+    #[serde(default)]
+    quality: Option<ImageQualityOption>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ImageBackgroundOption {
+    Auto,
+    Transparent,
+    Opaque,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ImageQualityOption {
+    Auto,
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+enum ImageSizeOption {
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "1024x1024")]
+    Square,
+    #[serde(rename = "1536x1024")]
+    Landscape,
+    #[serde(rename = "1024x1536")]
+    Portrait,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
@@ -187,6 +237,8 @@ struct ProviderImage {
     byte_length: usize,
     width: u32,
     height: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transparent_background: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -216,6 +268,7 @@ struct ProviderFailure {
 #[derive(Debug, Clone)]
 struct ProviderConfig {
     runtime_package: PathBuf,
+    codex_home: PathBuf,
     model: String,
     workspace: PathBuf,
 }
@@ -223,12 +276,16 @@ struct ProviderConfig {
 impl ProviderConfig {
     fn from_environment() -> ProviderResult<Self> {
         let runtime_package = required_path("VERGERAIL_CODEX_PACKAGE")?;
+        let codex_home = required_path("VERGERAIL_CODEX_HOME")?;
         let model = required_string("VERGERAIL_MODEL")?;
         let workspace = required_path("VERGERAIL_WORKSPACE")?;
-        if !absolute_clean_path(&runtime_package) || !absolute_clean_path(&workspace) {
+        if !absolute_clean_path(&runtime_package)
+            || !absolute_clean_path(&codex_home)
+            || !absolute_clean_path(&workspace)
+        {
             return Err(failure(
                 "invalid_configuration",
-                "runtime package and workspace must be absolute paths without parent traversal",
+                "runtime package, Codex home, and workspace must be absolute paths without parent traversal",
                 false,
             ));
         }
@@ -241,6 +298,7 @@ impl ProviderConfig {
         }
         Ok(Self {
             runtime_package,
+            codex_home,
             model,
             workspace,
         })
@@ -531,6 +589,12 @@ fn validate_request(request: ProviderRequest) -> ProviderResult<ProviderRequest>
             "model_turn does not accept prompt; provide messages",
             false,
         ));
+    } else if request.image_options.is_some() {
+        return Err(failure(
+            "invalid_request",
+            "imageOptions is only valid for image_generate",
+            false,
+        ));
     } else if request.messages.is_empty() {
         return Err(failure(
             "invalid_request",
@@ -713,15 +777,21 @@ async fn async_run_request(
     let runtime = RuntimePackage::pinned(&config.runtime_package).map_err(|error| {
         failure(
             "runtime_verification",
-            &format!("pinned runtime verification failed: {error}"),
+            &format!("configured runtime verification failed: {error}"),
             false,
         )
     })?;
     let enable_images = request.operation == ProviderOperation::ImageGenerate;
-    let codex = connect(runtime, enable_images).await?;
+    let codex = connect(
+        runtime,
+        enable_images,
+        &config.codex_home,
+        Duration::from_millis(request.timeout_ms),
+    )
+    .await?;
     let operation = match request.operation {
         ProviderOperation::ModelTurn => run_model_turn(&codex, &config, &request).await,
-        ProviderOperation::ImageGenerate => run_image_generation(&codex, &config, &request).await,
+        ProviderOperation::ImageGenerate => run_image_generation(&codex, &request).await,
     };
     let shutdown = codex
         .shutdown()
@@ -742,10 +812,18 @@ async fn async_run_request(
     }
 }
 
-async fn connect(runtime: RuntimePackage, enable_images: bool) -> ProviderResult<Codex> {
+async fn connect(
+    runtime: RuntimePackage,
+    enable_images: bool,
+    codex_home: &std::path::Path,
+    request_timeout: Duration,
+) -> ProviderResult<Codex> {
     Codex::connect(
         CodexConfig::new(runtime)
+            .with_codex_home(codex_home)
+            .map_err(|error| failure("invalid_configuration", &error.to_string(), false))?
             .with_image_generation(enable_images)
+            .with_request_timeout(request_timeout)
             .with_max_frame_bytes(if enable_images {
                 MAX_IMAGE_FRAME_BYTES
             } else {
@@ -899,109 +977,74 @@ fn model_session_bytes(maximum_text_bytes: usize) -> usize {
 
 async fn run_image_generation(
     codex: &Codex,
-    config: &ProviderConfig,
     request: &ProviderRequest,
 ) -> ProviderResult<Response> {
     let prompt = request
         .prompt
         .as_deref()
         .ok_or_else(|| failure("invalid_request", "image_generate requires prompt", false))?;
-    let session = codex
-        .session(
-            SessionOptions::read_only(&config.workspace)
-                .with_model(&config.model)
-                .with_reasoning(map_reasoning(request.reasoning))
-                .with_turn_timeout(Duration::from_millis(request.timeout_ms))
-                .with_maximum_output_bytes(MAX_IMAGE_BYTES * 2)
-                .image_only()
-                .with_developer_instructions(
-                    "Use image generation exactly once. Do not use shell, file, web, app, plugin, browser, computer-use, or subagent tools. Return no textual answer.",
-                ),
-        )
+    let options = request.image_options.as_ref();
+    let direct = DirectImageRequest {
+        model: "gpt-image-1".to_owned(),
+        prompt: prompt.to_owned(),
+        background: options
+            .and_then(|options| options.background)
+            .map(direct_background)
+            .unwrap_or(ImageBackground::Auto),
+        size: options
+            .and_then(|options| options.size)
+            .map(direct_size)
+            .unwrap_or(ImageSize::Auto),
+        quality: options
+            .and_then(|options| options.quality)
+            .map(direct_quality)
+            .unwrap_or(ImageQuality::Auto),
+    };
+    let generated = codex
+        .generate_image(direct)
         .await
         .map_err(|error| classify_vergerail_error(&error.to_string(), error.kind()))?;
-    let verification = async {
-        let result = session
-            .start(prompt)
-            .await
-            .map_err(|error| classify_vergerail_error(&error.to_string(), error.kind()))?
-            .wait()
-            .await
-            .map_err(|error| classify_vergerail_error(&error.to_string(), error.kind()))?;
-        if result.status != TurnStatus::Completed
-            || !result.text.trim().is_empty()
-            || result.image_generations.len() != 1
-        {
-            return Err(failure(
-                "invalid_provider_output",
-                "image turn did not complete with exactly one image and no textual output",
-                false,
-            ));
-        }
-        let image = &result.image_generations[0];
-        if image.status() != "completed"
-            || image.failure().is_some()
-            || image.result_base64().is_empty()
-        {
-            return Err(failure(
-                "image_generation_failed",
-                "image generation returned a non-completed lifecycle state",
-                false,
-            ));
-        }
-        let provider_image =
-            provider_image_from_base64(image.result_base64(), request.maximum_response_bytes)?;
-        let audit = session
-            .audit_turn(&result.turn_id)
-            .await
-            .map_err(|error| classify_vergerail_error(&error.to_string(), error.kind()))?;
-        if !audit.commands.is_empty() || !audit.file_changes.is_empty() {
-            return Err(failure(
-                "provider_failed",
-                "image turn recorded a command or file change outside the image item",
-                false,
-            ));
-        }
-        if audit.other_item_types.iter().any(|item_type| {
-            !matches!(
-                item_type.as_str(),
-                "userMessage" | "agentMessage" | "reasoning"
-            )
-        }) {
-            return Err(failure(
-                "provider_failed",
-                "image turn recorded an unsupported non-image item",
-                false,
-            ));
-        }
-        if audit.image_generations.as_slice() != result.image_generations.as_slice() {
-            return Err(failure(
-                "provider_failed",
-                "image turn audit did not match the retained image item",
-                false,
-            ));
-        }
-        Ok(provider_image)
-    }
-    .await;
-    let close = session.close().await;
-    match (verification, close) {
-        (Ok(image), Ok(())) => Ok(Response::Image(ImageResponse {
-            schema_version: PROTOCOL_VERSION,
-            request_id: request.request_id.clone(),
-            operation: ProviderOperation::ImageGenerate,
-            image,
-        })),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(classify_vergerail_error(&error.to_string(), error.kind())),
-        (Err(error), Err(close_error)) => Err(failure(
-            "provider_failed",
-            &format!(
-                "image operation failed and cleanup failed: {}; {}",
-                error.message, close_error
-            ),
+    let mut provider_image =
+        provider_image_from_base64(generated.base64(), request.maximum_response_bytes)?;
+    if (provider_image.width, provider_image.height) != (generated.width(), generated.height()) {
+        return Err(failure(
+            "invalid_provider_output",
+            "direct image response dimensions did not match the decoded PNG",
             false,
-        )),
+        ));
+    }
+    provider_image.transparent_background = generated.transparent_background();
+    Ok(Response::Image(ImageResponse {
+        schema_version: PROTOCOL_VERSION,
+        request_id: request.request_id.clone(),
+        operation: ProviderOperation::ImageGenerate,
+        image: provider_image,
+    }))
+}
+
+fn direct_background(value: ImageBackgroundOption) -> ImageBackground {
+    match value {
+        ImageBackgroundOption::Auto => ImageBackground::Auto,
+        ImageBackgroundOption::Transparent => ImageBackground::Transparent,
+        ImageBackgroundOption::Opaque => ImageBackground::Opaque,
+    }
+}
+
+fn direct_size(value: ImageSizeOption) -> ImageSize {
+    match value {
+        ImageSizeOption::Auto => ImageSize::Auto,
+        ImageSizeOption::Square => ImageSize::Square,
+        ImageSizeOption::Landscape => ImageSize::Landscape,
+        ImageSizeOption::Portrait => ImageSize::Portrait,
+    }
+}
+
+fn direct_quality(value: ImageQualityOption) -> ImageQuality {
+    match value {
+        ImageQualityOption::Auto => ImageQuality::Auto,
+        ImageQualityOption::Low => ImageQuality::Low,
+        ImageQualityOption::Medium => ImageQuality::Medium,
+        ImageQualityOption::High => ImageQuality::High,
     }
 }
 
@@ -1037,6 +1080,7 @@ fn provider_image_from_base64(
         byte_length: bytes.len(),
         width,
         height,
+        transparent_background: None,
     })
 }
 
@@ -1460,6 +1504,7 @@ mod tests {
             timeout_ms: 1_000,
             maximum_response_bytes: 1_024,
             prompt: None,
+            image_options: None,
         }
     }
 
@@ -1485,6 +1530,50 @@ mod tests {
         assert_eq!(
             validate_request(oversized).expect_err("bound").code,
             "invalid_request"
+        );
+    }
+
+    #[test]
+    fn image_options_are_strictly_typed_and_only_valid_for_image_generation() {
+        let mut image = request(ProviderOperation::ImageGenerate);
+        image.messages.clear();
+        image.prompt = Some("make a game sprite".to_owned());
+        image.image_options = Some(ImageGenerationOptions {
+            background: Some(ImageBackgroundOption::Transparent),
+            size: Some(ImageSizeOption::Portrait),
+            quality: Some(ImageQualityOption::High),
+        });
+        validate_request(image).expect("typed image options");
+
+        let mut model = request(ProviderOperation::ModelTurn);
+        model.image_options = Some(ImageGenerationOptions {
+            background: Some(ImageBackgroundOption::Opaque),
+            size: None,
+            quality: None,
+        });
+        assert_eq!(
+            validate_request(model)
+                .expect_err("image options must not cross the model-turn contract")
+                .code,
+            "invalid_request"
+        );
+
+        assert!(
+            serde_json::from_value::<ImageGenerationOptions>(json!({
+                "background": "transparent",
+                "size": "2048x2048",
+                "quality": "high"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ImageGenerationOptions>(json!({
+                "background": "transparent",
+                "size": "1024x1024",
+                "quality": "high",
+                "unknown": true
+            }))
+            .is_err()
         );
     }
 

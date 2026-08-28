@@ -151,7 +151,7 @@ impl RuntimeArtifact {
     }
 }
 
-/// Immutable identity expected from a Codex runtime package.
+/// Immutable identity expected from the audited official Codex runtime package.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeLock {
     pub(crate) version: String,
@@ -189,6 +189,13 @@ impl RuntimeLock {
         validate_runtime_identifier(&lock.version, "version")?;
         validate_runtime_identifier(&lock.target, "target")?;
         validate_runtime_identifier(&lock.variant, "variant")?;
+        if lock.variant != "codex" {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "RuntimeLock::new",
+                "runtime variant must be codex",
+            ));
+        }
         if lock.artifacts.is_empty() {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
