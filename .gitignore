@@ -14,9 +14,6 @@
 .env.*
 !.env.example
 auth.json
-vergerail-projects.json
-.vergerail-managed-home
-.vergerail-home.lock
 *.jsonl
 *.sqlite
 *.sqlite3
@@ -31,8 +28,6 @@ vergerail-projects.json
 *.key
 *.p12
 /.vergerail/
-/codex-home/
-/.codex-home/
 /runtime/vendor/
 /runtime/cache/
 .vergerail-download-*

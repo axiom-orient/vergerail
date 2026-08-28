@@ -6,7 +6,6 @@ use vergerail::{Account, Codex, CodexConfig, DownloadPolicy, RuntimeOrigin, Runt
 #[ignore = "downloads and installs the pinned 0.150.1 macOS runtime"]
 async fn downloads_connects_and_reuses_the_managed_runtime() {
     let cache = tempfile::tempdir().expect("isolated shared runtime cache");
-    let home = tempfile::tempdir().expect("isolated CODEX_HOME");
     let resolved = RuntimeResolver::new()
         .with_cache_root(cache.path())
         .resolve()
@@ -14,12 +13,12 @@ async fn downloads_connects_and_reuses_the_managed_runtime() {
         .expect("download and verify managed runtime");
     assert_eq!(resolved.origin(), RuntimeOrigin::Downloaded);
 
-    let codex = Codex::connect(CodexConfig::new(resolved.into_package(), home.path()))
+    let codex = Codex::connect(CodexConfig::new(resolved.into_package()))
         .await
         .expect("connect to managed app-server");
     assert!(matches!(
         codex.account().await.expect("account/read"),
-        Account::SignedOut { .. }
+        Account::ChatGpt { .. }
     ));
     codex.shutdown().await.expect("clean shutdown");
 

@@ -17,16 +17,13 @@ use tempfile::tempdir;
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use vergerail::{
     Account, ApprovalEvent, Codex, CodexConfig, CommandDecision, Event, FileChangeDecision,
-    LoginMethod, ReasoningEffort, RuntimePackage, RuntimeResolver, SessionOptions, TurnAudit,
-    TurnStatus,
+    ReasoningEffort, RuntimePackage, RuntimeResolver, SessionOptions, TurnAudit, TurnStatus,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn StdError>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let codex_home = required_path("VERGERAIL_CODEX_HOME")?;
-    let home_owner = required_string("VERGERAIL_HOME_OWNER")?;
     let required_model = required_string("VERGERAIL_MODEL")?;
     let workspace = required_path("VERGERAIL_WORKSPACE")?;
     let perfectpixel = required_path("VERGERAIL_PERFECTPIXEL_BIN")?;
@@ -39,12 +36,7 @@ async fn main() -> Result<()> {
         Some(package_root) => host_runtime(PathBuf::from(package_root))?,
         None => RuntimeResolver::new().resolve().await?.into_package(),
     };
-    let codex = Codex::connect(
-        CodexConfig::new(runtime, codex_home)
-            .with_home_owner(home_owner.clone())
-            .with_image_generation(true),
-    )
-    .await?;
+    let codex = Codex::connect(CodexConfig::new(runtime).with_image_generation(true)).await?;
 
     let verification = verify_live_account(
         &codex,
@@ -59,9 +51,9 @@ async fn main() -> Result<()> {
     match (verification, shutdown) {
         (Ok(model), Ok(())) => {
             if image_only {
-                println!("VERGERAIL_IMAGE_ONLY_OK model={model} owner={home_owner} reasoning=low");
+                println!("VERGERAIL_IMAGE_ONLY_OK model={model} reasoning=low");
             } else {
-                println!("VERGERAIL_LIVE_E2E_FULL_OK model={model} owner={home_owner}");
+                println!("VERGERAIL_LIVE_E2E_FULL_OK model={model}");
             }
             Ok(())
         }
@@ -81,17 +73,13 @@ async fn verify_live_account(
     perfectpixel: &Path,
     image_only: bool,
 ) -> Result<String> {
-    let account = match codex.account().await? {
-        account @ Account::ChatGpt { .. } => account,
-        Account::SignedOut { .. } => {
-            let login = codex.login(LoginMethod::Browser).await?;
-            let auth_url = login
-                .auth_url()
-                .ok_or_else(|| io::Error::other("browser login did not return an auth URL"))?;
-            handoff_auth_url(auth_url);
-            login.wait().await?
-        }
-    };
+    let account = codex.account().await?;
+    if matches!(account, Account::SignedOut { .. }) {
+        return Err(io::Error::other(
+            "the standard Codex account is signed out; sign in through ChatGPT or run `codex login`",
+        )
+        .into());
+    }
     if !matches!(account, Account::ChatGpt { .. }) {
         return Err(io::Error::other("ChatGPT account was not authenticated").into());
     }
@@ -1452,11 +1440,6 @@ impl Drop for LoopbackProbe {
             let _ = worker.join();
         }
     }
-}
-
-fn handoff_auth_url(auth_url: &str) {
-    eprintln!("Open this one-time URL in a browser, complete login, and return here:\n");
-    eprintln!("{auth_url}\n");
 }
 
 async fn require_no_diagnostics(codex: &Codex, phase: &str) -> Result<()> {

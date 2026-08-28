@@ -185,7 +185,7 @@ fn cache_early_login_result(state: &mut LoginState, login_id: &str, result: Resu
 /// Account state reported by Codex app-server.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Account {
-    /// No account is currently authenticated in the dedicated Codex home.
+    /// No account is currently authenticated in the standard Codex home.
     SignedOut {
         /// Whether app-server requires OpenAI authentication for model use.
         requires_openai_auth: bool,

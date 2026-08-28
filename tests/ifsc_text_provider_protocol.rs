@@ -3,7 +3,6 @@
 use serde_json::{Value, json};
 use std::io::Write as _;
 use std::process::{Command, Output, Stdio};
-use tempfile::tempdir;
 
 const PROVIDER: &str = env!("CARGO_BIN_EXE_ifsc_text_provider");
 
@@ -47,10 +46,8 @@ fn valid_request() -> Value {
 
 fn execute(input: &[u8]) -> Output {
     let mut child = Command::new(PROVIDER)
-        .env_remove("VERGERAIL_CODEX_HOME")
         .env_remove("VERGERAIL_WORKSPACE")
         .env_remove("VERGERAIL_CODEX_PACKAGE")
-        .env_remove("VERGERAIL_HOME_OWNER")
         .env_remove("VERGERAIL_MODEL")
         .env_remove("VERGERAIL_IFSC_RUNTIME_DOWNLOAD")
         .env_remove("VERGERAIL_IFSC_TURN_TIMEOUT_MS")
@@ -132,47 +129,11 @@ fn invalid_oversized_request_id_is_not_reflected() {
 }
 
 #[test]
-fn valid_request_reports_missing_dedicated_configuration() {
+fn valid_request_reports_missing_runtime_configuration() {
     let response = typed_error(&execute(
         &serde_json::to_vec(&valid_request()).expect("valid request"),
     ));
     assert_eq!(response["error"]["code"], "configuration-invalid");
-    assert_eq!(response["error"]["requestId"], "protocol-test-0001");
-    assert_eq!(response["error"]["retryable"], false);
-}
-
-#[test]
-#[ignore = "requires VERGERAIL_CODEX_PACKAGE with the audited official runtime"]
-fn official_runtime_signed_out_path_is_typed_and_clean() {
-    let package = std::env::var_os("VERGERAIL_CODEX_PACKAGE")
-        .expect("VERGERAIL_CODEX_PACKAGE must name the audited official runtime");
-    let root = tempdir().expect("temporary provider root");
-    let home = root.path().join("home");
-    let workspace = root.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("temporary workspace");
-    let mut child = Command::new(PROVIDER)
-        .env("VERGERAIL_CODEX_HOME", &home)
-        .env("VERGERAIL_WORKSPACE", &workspace)
-        .env("VERGERAIL_CODEX_PACKAGE", package)
-        .env("VERGERAIL_HOME_OWNER", "ifsc-screen-program")
-        .env("VERGERAIL_MODEL", "gpt-5.6-luna")
-        .env("VERGERAIL_IFSC_RUNTIME_DOWNLOAD", "never")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("provider process must start");
-    child
-        .stdin
-        .take()
-        .expect("piped stdin")
-        .write_all(&serde_json::to_vec(&valid_request()).expect("valid request"))
-        .expect("request input");
-    let output = child.wait_with_output().expect("provider output");
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stderr.is_empty());
-    let response: Value = serde_json::from_slice(&output.stdout).expect("typed provider response");
-    assert_eq!(response["error"]["code"], "authentication-required");
     assert_eq!(response["error"]["requestId"], "protocol-test-0001");
     assert_eq!(response["error"]["retryable"], false);
 }

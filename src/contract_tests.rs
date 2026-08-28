@@ -15,6 +15,7 @@ use std::path::Path;
 
 const SCRIPT: &str = r###"#!/usr/bin/env python3
 import json
+import os
 import sys
 
 if len(sys.argv) == 2 and sys.argv[1] == "--version":
@@ -31,6 +32,7 @@ for raw in sys.stdin:
     method = message.get("method")
     request_id = message.get("id")
     if method == "initialize":
+        assert "CODEX_HOME" not in os.environ
         send({"id": request_id, "result": {"userAgent": "fake"}})
         send({"method": "configWarning", "params": {"summary": "fake config warning"}})
         send({"id": 901, "method": "item/tool/call", "params": {"threadId": "missing"}})
@@ -494,11 +496,10 @@ for raw in sys.stdin:
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn complete_contract_uses_real_process_and_bidirectional_rpc() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), SCRIPT);
 
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
 
@@ -590,7 +591,6 @@ async fn complete_contract_uses_real_process_and_bidirectional_rpc() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_output_schema_and_extended_reasoning_reach_turn_start() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let schema = serde_json::json!({
         "type": "object",
@@ -609,7 +609,7 @@ async fn native_output_schema_and_extended_reasoning_reach_turn_start() {
     );
     assert_ne!(script, SCRIPT, "turn/start assertion must be active");
     let package = create_fake_package(package_directory.path(), &script);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
 
@@ -631,7 +631,6 @@ async fn native_output_schema_and_extended_reasoning_reach_turn_start() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn image_only_thread_enables_no_other_capability() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let script = SCRIPT.replace(
         "elif method == \"thread/start\":",
@@ -650,11 +649,9 @@ async fn image_only_thread_enables_no_other_capability() {
         "thread/start capability assertion must be active"
     );
     let package = create_fake_package(package_directory.path(), &script);
-    let codex = Codex::connect(
-        CodexConfig::new(package, home_directory.path()).with_image_generation(true),
-    )
-    .await
-    .expect("connect");
+    let codex = Codex::connect(CodexConfig::new(package).with_image_generation(true))
+        .await
+        .expect("connect");
     let session = codex
         .session(
             SessionOptions::read_only(project_directory.path())
@@ -670,7 +667,6 @@ async fn image_only_thread_enables_no_other_capability() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn image_generation_session_sends_low_reasoning_effort() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let low_effort_script = SCRIPT.replace(
         "assert message[\"params\"][\"effort\"] == \"medium\"",
@@ -681,7 +677,7 @@ async fn image_generation_session_sends_low_reasoning_effort() {
         "the low-effort contract must be active"
     );
     let package = create_fake_package(package_directory.path(), &low_effort_script);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
 
@@ -701,10 +697,9 @@ async fn image_generation_session_sends_low_reasoning_effort() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_interrupt_dispatches_exact_ids_and_reaches_terminal_state() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), INTERRUPT_SCRIPT);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
 
@@ -728,11 +723,9 @@ async fn repeated_interrupt_callers_share_one_provider_request() {
     use std::time::Duration;
 
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), REPEATED_INTERRUPT_SCRIPT);
-    let config = CodexConfig::new(package, home_directory.path())
-        .with_request_timeout(Duration::from_secs(5));
+    let config = CodexConfig::new(package).with_request_timeout(Duration::from_secs(5));
     let codex = Codex::connect(config).await.expect("connect");
     let session = codex
         .session(SessionOptions::read_only(project_directory.path()).ephemeral())
@@ -769,10 +762,9 @@ async fn repeated_interrupt_callers_share_one_provider_request() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_run_auto_denies_approvals_and_cleans_up_the_ephemeral_session() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), SCRIPT);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
 
@@ -795,13 +787,11 @@ async fn malformed_login_completion_is_connection_fatal_instead_of_timing_out() 
     use std::time::Duration;
 
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let package = create_fake_package(package_directory.path(), MALFORMED_LOGIN_COMPLETION_SCRIPT);
-    let codex = Codex::connect(
-        CodexConfig::new(package, home_directory.path()).with_login_timeout(Duration::from_secs(5)),
-    )
-    .await
-    .expect("connect");
+    let codex =
+        Codex::connect(CodexConfig::new(package).with_login_timeout(Duration::from_secs(5)))
+            .await
+            .expect("connect");
 
     let login = codex
         .login(LoginMethod::DeviceCode)
@@ -829,10 +819,9 @@ async fn malformed_login_completion_is_connection_fatal_instead_of_timing_out() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_run_preserves_primary_failure_when_cleanup_also_fails() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), RUN_AND_CLEANUP_FAILURE_SCRIPT);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
 
@@ -863,10 +852,9 @@ async fn one_shot_run_preserves_primary_failure_when_cleanup_also_fails() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persisted_thread_can_be_resumed_run_and_unsubscribed() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), SCRIPT);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
 
@@ -905,9 +893,8 @@ async fn login_timeout_keeps_handle_cancelable_and_records_terminal_cancellation
     use std::time::Duration;
 
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let package = create_fake_package(package_directory.path(), LOGIN_TIMEOUT_SCRIPT);
-    let mut config = CodexConfig::new(package, home_directory.path());
+    let mut config = CodexConfig::new(package);
     config.login_timeout = Duration::from_millis(100);
     let codex = Codex::connect(config).await.expect("connect");
 
@@ -932,10 +919,8 @@ async fn login_response_followed_by_disconnect_is_retained_as_terminal_failure()
     use std::time::Duration;
 
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let package = create_fake_package(package_directory.path(), LOGIN_DISCONNECT_SCRIPT);
-    let config =
-        CodexConfig::new(package, home_directory.path()).with_login_timeout(Duration::from_secs(5));
+    let config = CodexConfig::new(package).with_login_timeout(Duration::from_secs(5));
     let codex = Codex::connect(config).await.expect("connect");
     let login = codex
         .login(LoginMethod::DeviceCode)
@@ -953,11 +938,10 @@ async fn login_response_followed_by_disconnect_is_retained_as_terminal_failure()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsubscribe_failure_preserves_session_for_retry() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), UNSUBSCRIBE_RETRY_SCRIPT);
 
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
     let session = codex
@@ -983,10 +967,9 @@ async fn unsubscribe_failure_preserves_session_for_retry() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persisted_turn_audit_recovers_items_omitted_from_live_notifications() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), TURN_AUDIT_SCRIPT);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
     let session = codex
@@ -1029,10 +1012,9 @@ async fn persisted_turn_audit_recovers_items_omitted_from_live_notifications() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_audit_rejects_partial_wrong_and_malformed_runtime_history() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), TURN_AUDIT_SCRIPT);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
 
@@ -1064,10 +1046,9 @@ async fn turn_audit_rejects_partial_wrong_and_malformed_runtime_history() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_audit_rejects_invalid_session_states_without_a_read_request() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), TURN_AUDIT_SCRIPT);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
 
@@ -1154,6 +1135,12 @@ fn create_fake_package(root: &Path, script: &str) -> RuntimePackage {
     )
     .expect("runtime lock");
     RuntimePackage::new(root, lock)
+}
+
+fn with_marker_root(script: &str, root: &Path) -> String {
+    let root = root.to_str().expect("marker root must be UTF-8");
+    let quoted = serde_json::to_string(root).expect("marker root JSON string");
+    script.replace("__MARKER_ROOT__", &quoted)
 }
 
 fn create_timeout_package(root: &Path) -> RuntimePackage {
@@ -1554,7 +1541,7 @@ if len(sys.argv) == 2 and sys.argv[1] == "--version":
     print("codex-cli 0.test")
     raise SystemExit(0)
 
-home = os.environ["CODEX_HOME"]
+home = __MARKER_ROOT__
 
 def mark(name):
     with open(os.path.join(home, name), "w", encoding="utf-8") as marker:
@@ -1607,7 +1594,7 @@ if len(sys.argv) == 2 and sys.argv[1] == "--version":
     print("codex-cli 0.test")
     raise SystemExit(0)
 
-home = os.environ["CODEX_HOME"]
+home = __MARKER_ROOT__
 
 def mark(name):
     with open(os.path.join(home, name), "w", encoding="utf-8") as marker:
@@ -1831,10 +1818,9 @@ for raw in sys.stdin:
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_write_uses_exact_pinned_policy() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), WORKSPACE_POLICY_SCRIPT);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
     let session = codex
@@ -1858,9 +1844,8 @@ async fn idempotent_request_timeout_is_explicit_and_runtime_remains_controllable
     use std::time::Duration;
 
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let package = create_timeout_package(package_directory.path());
-    let config = CodexConfig::new(package, home_directory.path())
+    let config = CodexConfig::new(package)
         .with_request_timeout(Duration::from_millis(500))
         .with_shutdown_timeout(Duration::from_secs(1));
     let codex = Codex::connect(config).await.expect("connect");
@@ -1881,10 +1866,9 @@ async fn active_turn_timeout_interrupts_and_preserves_runtime_recovery() {
     use std::time::Duration;
 
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), RUN_TIMEOUT_SCRIPT);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
     let session = codex
@@ -1922,10 +1906,9 @@ async fn cumulative_output_limit_interrupts_and_releases_the_session() {
     use std::time::Duration;
 
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), RUN_OUTPUT_LIMIT_SCRIPT);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
     let session = codex
@@ -1959,10 +1942,9 @@ async fn non_idempotent_timeout_is_outcome_unknown_and_runtime_is_terminated() {
     use std::time::Duration;
 
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_timeout_package(package_directory.path());
-    let config = CodexConfig::new(package, home_directory.path())
+    let config = CodexConfig::new(package)
         .with_request_timeout(Duration::from_millis(500))
         .with_shutdown_timeout(Duration::from_secs(1));
     let codex = Codex::connect(config).await.expect("connect");
@@ -1986,9 +1968,8 @@ async fn non_idempotent_timeout_is_outcome_unknown_and_runtime_is_terminated() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stdout_eof_fails_all_pending_requests_and_redacts_stderr() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let package = create_fake_package(package_directory.path(), EOF_PENDING_SCRIPT);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
     let (first, second) = tokio::join!(codex.account(), codex.account());
@@ -2007,11 +1988,10 @@ async fn stdout_eof_fails_all_pending_requests_and_redacts_stderr() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_sessions_route_interleaved_events_without_cross_talk() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let first_project = tempfile::tempdir().expect("first project");
     let second_project = tempfile::tempdir().expect("second project");
     let package = create_fake_package(package_directory.path(), CONCURRENT_RUNS_SCRIPT);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
     let first = codex
@@ -2040,11 +2020,9 @@ async fn consumer_lag_is_observable_and_interrupts_the_turn() {
     use std::time::Duration;
 
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), CONSUMER_LAG_SCRIPT);
-    let mut config = CodexConfig::new(package, home_directory.path())
-        .with_request_timeout(Duration::from_secs(10));
+    let mut config = CodexConfig::new(package).with_request_timeout(Duration::from_secs(10));
     config.event_capacity = 1;
     let codex = Codex::connect(config).await.expect("connect");
     let session = codex
@@ -2090,10 +2068,9 @@ async fn consumer_lag_is_observable_and_interrupts_the_turn() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_failure_before_start_acknowledgement_does_not_leak_the_run_route() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), PRE_ACK_FAILURE_SCRIPT);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
     let session = codex
@@ -2121,11 +2098,9 @@ async fn pre_acknowledgement_event_overflow_interrupts_without_blocking_the_rout
     use std::time::Duration;
 
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), PRE_ACK_FAILURE_SCRIPT);
-    let mut config = CodexConfig::new(package, home_directory.path())
-        .with_request_timeout(Duration::from_secs(5));
+    let mut config = CodexConfig::new(package).with_request_timeout(Duration::from_secs(5));
     config.event_capacity = 1;
     let codex = Codex::connect(config).await.expect("connect");
     let session = codex
@@ -2168,11 +2143,9 @@ async fn pre_ack_terminal_overflow_uses_the_provider_terminal_without_interrupti
     use std::time::Duration;
 
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), PRE_ACK_TERMINAL_OVERFLOW_SCRIPT);
-    let mut config = CodexConfig::new(package, home_directory.path())
-        .with_request_timeout(Duration::from_secs(5));
+    let mut config = CodexConfig::new(package).with_request_timeout(Duration::from_secs(5));
     config.event_capacity = 1;
     let codex = Codex::connect(config).await.expect("connect");
     let session = codex
@@ -2217,11 +2190,9 @@ async fn shutdown_waits_for_in_flight_turn_start_ownership() {
     use std::time::Duration;
 
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), START_SHUTDOWN_RACE_SCRIPT);
-    let config = CodexConfig::new(package, home_directory.path())
-        .with_request_timeout(Duration::from_secs(3));
+    let config = CodexConfig::new(package).with_request_timeout(Duration::from_secs(3));
     let codex = Codex::connect(config).await.expect("connect");
     let session = Arc::new(
         codex
@@ -2269,9 +2240,10 @@ async fn cancelling_one_shot_run_interrupts_and_unsubscribes_ephemeral_session()
     let package_directory = tempfile::tempdir().expect("package tempdir");
     let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
-    let package = create_fake_package(package_directory.path(), CANCELLED_ONE_SHOT_SCRIPT);
+    let script = with_marker_root(CANCELLED_ONE_SHOT_SCRIPT, home_directory.path());
+    let package = create_fake_package(package_directory.path(), &script);
     let codex = Arc::new(
-        Codex::connect(CodexConfig::new(package, home_directory.path()))
+        Codex::connect(CodexConfig::new(package))
             .await
             .expect("connect"),
     );
@@ -2323,9 +2295,9 @@ async fn cancelling_shutdown_caller_does_not_cancel_owned_cleanup() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
     let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
-    let package = create_fake_package(package_directory.path(), CANCELLED_SHUTDOWN_SCRIPT);
-    let config = CodexConfig::new(package, home_directory.path())
-        .with_shutdown_timeout(Duration::from_secs(2));
+    let script = with_marker_root(CANCELLED_SHUTDOWN_SCRIPT, home_directory.path());
+    let package = create_fake_package(package_directory.path(), &script);
+    let config = CodexConfig::new(package).with_shutdown_timeout(Duration::from_secs(2));
     let codex = Codex::connect(config).await.expect("connect");
     let session = codex
         .session(SessionOptions::read_only(project_directory.path()).ephemeral())
@@ -2363,10 +2335,9 @@ async fn cancelling_shutdown_caller_does_not_cancel_owned_cleanup() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_known_notification_fails_closed_at_the_connection_boundary() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), MALFORMED_NOTIFICATION_SCRIPT);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
     let session = codex
@@ -2399,10 +2370,9 @@ async fn malformed_known_notification_fails_closed_at_the_connection_boundary() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_non_idempotent_create_response_disconnects_before_ownership_is_lost() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), MALFORMED_THREAD_START_SCRIPT);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
 
@@ -2428,10 +2398,9 @@ async fn malformed_non_idempotent_create_response_disconnects_before_ownership_i
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_approval_sends_fail_closed_response() {
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), APPROVAL_FAIL_CLOSED_SCRIPT);
-    let codex = Codex::connect(CodexConfig::new(package, home_directory.path()))
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
         .expect("connect");
     let session = codex
@@ -2461,11 +2430,9 @@ async fn approval_deadline_sends_one_fail_closed_response() {
     use std::time::Duration;
 
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let project_directory = tempfile::tempdir().expect("project tempdir");
     let package = create_fake_package(package_directory.path(), APPROVAL_FAIL_CLOSED_SCRIPT);
-    let config = CodexConfig::new(package, home_directory.path())
-        .with_approval_timeout(Duration::from_millis(80));
+    let config = CodexConfig::new(package).with_approval_timeout(Duration::from_millis(80));
     let codex = Codex::connect(config).await.expect("connect");
     let session = codex
         .session(SessionOptions::read_only(project_directory.path()).ephemeral())

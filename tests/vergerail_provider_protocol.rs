@@ -3,7 +3,6 @@
 use serde_json::{Value, json};
 use std::io::Write as _;
 use std::process::{Command, Output, Stdio};
-use tempfile::tempdir;
 
 const PROVIDER: &str = env!("CARGO_BIN_EXE_vergerail_provider");
 
@@ -44,9 +43,7 @@ fn image_request(reasoning: &str) -> Value {
 
 fn execute(value: &Value) -> Output {
     let mut child = Command::new(PROVIDER)
-        .env_remove("VERGERAIL_CODEX_HOME")
         .env_remove("VERGERAIL_CODEX_PACKAGE")
-        .env_remove("VERGERAIL_HOME_OWNER")
         .env_remove("VERGERAIL_MODEL")
         .env_remove("VERGERAIL_WORKSPACE")
         .stdin(Stdio::piped())
@@ -54,32 +51,6 @@ fn execute(value: &Value) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("provider process must start");
-    child
-        .stdin
-        .take()
-        .expect("piped stdin")
-        .write_all(&serde_json::to_vec(value).expect("request JSON"))
-        .expect("request input");
-    child.wait_with_output().expect("provider output")
-}
-
-fn execute_configured(
-    value: &Value,
-    package: &std::path::Path,
-    home: &std::path::Path,
-    workspace: &std::path::Path,
-) -> Output {
-    let mut child = Command::new(PROVIDER)
-        .env("VERGERAIL_CODEX_HOME", home)
-        .env("VERGERAIL_CODEX_PACKAGE", package)
-        .env("VERGERAIL_HOME_OWNER", "provider-protocol")
-        .env("VERGERAIL_MODEL", "gpt-5.6-luna")
-        .env("VERGERAIL_WORKSPACE", workspace)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("configured provider process must start");
     child
         .stdin
         .take()
@@ -205,24 +176,4 @@ fn malformed_tool_contract_is_rejected_without_runtime_access() {
     request["tools"][0]["inputSchema"] = json!([]);
     let result = response(&execute(&request));
     assert_eq!(result["error"]["code"], "invalid_request");
-}
-
-#[test]
-#[ignore = "requires VERGERAIL_CODEX_PACKAGE with the audited official runtime"]
-fn official_runtime_signed_out_path_is_typed_and_clean() {
-    let package = std::env::var_os("VERGERAIL_CODEX_PACKAGE")
-        .expect("VERGERAIL_CODEX_PACKAGE must name the audited official runtime");
-    let root = tempdir().expect("temporary provider root");
-    let home = root.path().join("home");
-    let workspace = root.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("temporary workspace");
-    let result = response(&execute_configured(
-        &model_request("xhigh", 1024),
-        std::path::Path::new(&package),
-        &home,
-        &workspace,
-    ));
-    assert_eq!(result["requestId"], "protocol-model-1");
-    assert_eq!(result["error"]["code"], "authentication_required");
-    assert_eq!(result["error"]["retryable"], false);
 }

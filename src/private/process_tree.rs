@@ -7,7 +7,6 @@ use std::io;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::process::{Child, Command};
 
@@ -17,7 +16,6 @@ const GUARDIAN_BYTES: &[u8] = include_bytes!(env!("VERGERAIL_GUARDIAN_PATH"));
 const GUARDIAN_SHA256: &str = env!("VERGERAIL_GUARDIAN_SHA256");
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 static GUARDIAN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 static GUARDIAN_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// The only process identity retained by Rust is its directly owned guardian.
@@ -75,20 +73,33 @@ pub(crate) fn extract_guardian(directory: &Path) -> io::Result<PathBuf> {
 }
 
 /// Creates a fresh private directory for a short-lived guardian extraction.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn create_guardian_directory(parent: &Path, prefix: &str) -> io::Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::DirBuilderExt as _;
 
-    let sequence = GUARDIAN_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let path = parent.join(format!(".{prefix}-{}-{sequence}", std::process::id()));
-    fs::create_dir(&path)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
-    Ok(path)
+    for _ in 0..128 {
+        let sequence = GUARDIAN_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(".{prefix}-{}-{sequence}", std::process::id()));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        match builder.create(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a fresh guardian directory after 128 collisions",
+    ))
 }
 
 /// Removes a private extraction directory after its helper has been removed.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn remove_guardian_directory(path: &Path) -> io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
     match fs::remove_dir(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -165,6 +176,9 @@ pub(crate) fn terminate(identity: ProcessIdentity, child: &mut Child) -> io::Res
 
 /// Removes a single per-run helper after the guardian has been reaped.
 pub(crate) fn remove_guardian(path: &Path) -> io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -332,12 +346,12 @@ sleep 10 while 1;
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn compile_legacy_fixture(directory: &Path) -> io::Result<PathBuf> {
+    fn compile_survivor_fixture(directory: &Path) -> io::Result<PathBuf> {
         let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("fixtures")
-            .join("legacy_guardian_mutant.c");
-        let output = directory.join("vergerail-test-legacy-fixture");
+            .join("guardian_survivor_mutant.c");
+        let output = directory.join("vergerail-test-survivor-fixture");
         let status = HostCommand::new("/usr/bin/clang")
             .args([
                 "-std=c11",
@@ -802,7 +816,7 @@ sleep 10 while 1;
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn run_legacy_mutation_scenario(
+    fn run_survivor_mutation_scenario(
         scenario: MutationScenario,
         report: Arc<Mutex<MutationCleanupReport>>,
     ) -> io::Result<()> {
@@ -816,11 +830,11 @@ sleep 10 while 1;
         let ack = directory.path().join("mutant-first-empty-scan");
         let fixture = directory.path().join("mutant-late-fork.pl");
         write_late_fork_fixture(&fixture)?;
-        let mutant = compile_legacy_fixture(directory.path())?;
+        let mutant = compile_survivor_fixture(directory.path())?;
 
         let mut command = HostCommand::new(&mutant);
         command
-            .arg("--legacy-ack")
+            .arg("--survivor-probe")
             .arg(&ack)
             .arg("--wait-for")
             .arg(&ready)
@@ -907,21 +921,21 @@ sleep 10 while 1;
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn legacy_mutant_fixture_proves_old_survivor_and_unconditional_cleanup() -> io::Result<()> {
+    fn survivor_mutant_fixture_proves_unconditional_cleanup() -> io::Result<()> {
         let normal_report = Arc::new(Mutex::new(MutationCleanupReport::default()));
-        run_legacy_mutation_scenario(MutationScenario::Normal, Arc::clone(&normal_report))?;
+        run_survivor_mutation_scenario(MutationScenario::Normal, Arc::clone(&normal_report))?;
         assert_mutation_cleanup_report(&normal_report, "normal");
 
         let error_report = Arc::new(Mutex::new(MutationCleanupReport::default()));
         assert!(
-            run_legacy_mutation_scenario(MutationScenario::Error, Arc::clone(&error_report))
+            run_survivor_mutation_scenario(MutationScenario::Error, Arc::clone(&error_report))
                 .is_err()
         );
         assert_mutation_cleanup_report(&error_report, "error");
 
         let panic_report = Arc::new(Mutex::new(MutationCleanupReport::default()));
         let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            run_legacy_mutation_scenario(MutationScenario::Panic, Arc::clone(&panic_report))
+            run_survivor_mutation_scenario(MutationScenario::Panic, Arc::clone(&panic_report))
         }));
         assert!(panic_result.is_err(), "panic injection did not panic");
         assert_mutation_cleanup_report(&panic_report, "panic");

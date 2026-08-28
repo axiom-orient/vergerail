@@ -10,9 +10,7 @@ cargo build --locked --release --bin ifsc_text_provider
 
 필수 환경 변수:
 
-- `VERGERAIL_CODEX_HOME`: 일반 `~/.codex`가 아닌 이 consumer 전용 Codex home
 - `VERGERAIL_WORKSPACE`: 존재하는 읽기 전용 작업 디렉터리
-- `VERGERAIL_HOME_OWNER`: 이 consumer의 안정적인 lowercase owner ID
 - `VERGERAIL_MODEL`: model catalog에서 정확히 일치하는 visible model
 
 선택 환경 변수:
@@ -23,11 +21,9 @@ cargo build --locked --release --bin ifsc_text_provider
 
 기본값은 실행 중 예기치 않은 runtime 다운로드를 하지 않습니다. 관리 cache가 없으면 검증된 package를 `VERGERAIL_CODEX_PACKAGE`로 주거나 설치를 명시적으로 `if-missing`으로 허용해야 합니다.
 
-전용 home이 signed-out이면 provider는 브라우저를 임의로 열지 않고 `authentication-required`로 실패합니다. 같은 home과 owner를 사용해 사용자가 승인하는 E2E login을 먼저 완료할 수 있습니다.
+provider는 표준 `~/.codex`의 ChatGPT 앱 또는 `codex login` 인증을 재사용합니다. signed-out이면 브라우저를 임의로 열지 않고 `authentication-required`로 실패합니다.
 
 ```bash
-export VERGERAIL_CODEX_HOME="$HOME/.local/share/vergerail-ifsc"
-export VERGERAIL_HOME_OWNER=ifsc-screen-program
 export VERGERAIL_MODEL=gpt-5.6-luna
 export VERGERAIL_WORKSPACE="$PWD"
 cargo run --locked --example live_e2e
@@ -113,7 +109,7 @@ stdin은 최대 512 KiB인 JSON 값 하나입니다. unknown field는 허용하�
   "schemaVersion": 1,
   "error": {
     "code": "authentication-required",
-    "message": "the dedicated Vergerail Codex home is signed out",
+    "message": "the standard Codex account is signed out",
     "retryable": false,
     "requestId": "screen-home-default-0001"
   }
@@ -140,7 +136,7 @@ cargo test --locked --test ifsc_text_provider_protocol
 cargo clippy --locked --bin ifsc_text_provider -- -D warnings
 ```
 
-이 검사는 JSON 경계, 크기 제한, unknown field, 약화된 constraint, effect/CSS escape, invented copy, bounds escape를 runtime이나 mock 모델 없이 검증합니다. 실제 모델 품질과 OAuth는 위 live E2E 및 IFSC end-to-end 실행으로 별도 검증해야 합니다. 2026-08-13에는 전용 OAuth home과 `gpt-5.6-luna`로 실제 요청을 실행했습니다. 계약 밖 `title`/`position` 응답이 저장되지 않고 typed failure가 되는 것을 확인한 뒤 bounded repair를 추가했으며, 후속 요청은 exit `0`, 동일 `requestId`, validator를 통과한 ScreenProgram과 usage 응답을 반환했습니다. IFSC는 이 프로그램을 HTML과 1440×1024 PNG로 렌더해 managed receipt에 저장했습니다.
+이 검사는 JSON 경계, 크기 제한, unknown field, 약화된 constraint, effect/CSS escape, invented copy, bounds escape를 runtime이나 mock 모델 없이 검증합니다. 실제 모델 품질과 인증 상태는 `scripts/verify.sh --release`의 live E2E로 검증합니다.
 
 빈 입력 process smoke:
 
@@ -148,9 +144,4 @@ cargo clippy --locked --bin ifsc_text_provider -- -D warnings
 cargo run --locked --bin ifsc_text_provider </dev/null
 ```
 
-기대 결과는 exit `2`와 `error.code = "invalid-request"`인 JSON 한 줄입니다. 공식 runtime의 signed-out 경로는 `VERGERAIL_CODEX_PACKAGE`를 설정한 뒤 다음 ignored test로 검증합니다.
-
-```bash
-cargo test --locked --test ifsc_text_provider_protocol \
-  official_runtime_signed_out_path_is_typed_and_clean -- --ignored --nocapture
-```
+기대 결과는 exit `2`와 `error.code = "invalid-request"`인 JSON 한 줄입니다.

@@ -6,19 +6,16 @@ use vergerail::{
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VERGERAIL_CODEX_PACKAGE pointing at the official 0.150.1 macOS package"]
-async fn connects_to_pinned_official_runtime_and_reads_signed_out_account() {
+async fn connects_to_pinned_official_runtime_and_reuses_standard_account() {
     let package_root = std::env::var_os("VERGERAIL_CODEX_PACKAGE")
         .expect("VERGERAIL_CODEX_PACKAGE must be set for this ignored test");
-    let home = tempfile::tempdir().expect("isolated CODEX_HOME");
     let runtime = RuntimePackage::pinned(package_root).expect("audited runtime selection");
-    let codex = Codex::connect(CodexConfig::new(runtime, home.path()))
+    let codex = Codex::connect(CodexConfig::new(runtime))
         .await
         .expect("connect to official app-server");
     assert!(matches!(
         codex.account().await.expect("account/read"),
-        Account::SignedOut {
-            requires_openai_auth: true
-        }
+        Account::ChatGpt { .. }
     ));
     codex.shutdown().await.expect("clean shutdown");
 }

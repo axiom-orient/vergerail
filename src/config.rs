@@ -1,20 +1,13 @@
 //! Connection and safety configuration.
 
-mod home;
-
-pub(crate) use home::ManagedHome;
-
 use crate::error::{Error, ErrorKind, Result};
 use crate::runtime::RuntimePackage;
-use std::path::PathBuf;
 use std::time::Duration;
 
 /// Complete configuration required to connect to a pinned app-server runtime.
 #[derive(Clone, Debug)]
 pub struct CodexConfig {
     pub(crate) runtime: RuntimePackage,
-    pub(crate) codex_home: PathBuf,
-    pub(crate) home_owner: String,
     pub(crate) client_name: String,
     pub(crate) client_title: String,
     pub(crate) request_timeout: Duration,
@@ -29,13 +22,11 @@ pub struct CodexConfig {
 }
 
 impl CodexConfig {
-    /// Creates a safe, deterministic configuration using a dedicated Codex home.
+    /// Creates a configuration that reuses the standard Codex account in `~/.codex`.
     #[must_use]
-    pub fn new(runtime: RuntimePackage, codex_home: impl Into<PathBuf>) -> Self {
+    pub fn new(runtime: RuntimePackage) -> Self {
         Self {
             runtime,
-            codex_home: codex_home.into(),
-            home_owner: "vergerail".to_owned(),
             client_name: "vergerail".to_owned(),
             client_title: "Vergerail".to_owned(),
             request_timeout: Duration::from_secs(30),
@@ -50,16 +41,6 @@ impl CodexConfig {
         }
     }
 
-    /// Binds the dedicated Codex home to one consuming application.
-    ///
-    /// A home first opened with one owner cannot later be opened by a different
-    /// owner, even when both applications use Vergerail.
-    #[must_use]
-    pub fn with_home_owner(mut self, owner: impl Into<String>) -> Self {
-        self.home_owner = owner.into();
-        self
-    }
-
     /// Sets the client title reported during the initialize handshake.
     #[must_use]
     pub fn with_client_title(mut self, title: impl Into<String>) -> Self {
@@ -67,7 +48,7 @@ impl CodexConfig {
         self
     }
 
-    /// Enables Codex image-generation tools in this dedicated managed home.
+    /// Enables Codex image-generation sessions for this client.
     ///
     /// The capability is disabled by default. Enabling it permits the pinned
     /// app-server to call its image-generation model; generated image bytes are
@@ -127,20 +108,6 @@ impl CodexConfig {
                 "client name and title must be non-empty",
             ));
         }
-        if self.codex_home.as_os_str().is_empty() {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "CodexConfig::validate",
-                "Codex home must be non-empty",
-            ));
-        }
-        if !valid_home_owner(&self.home_owner) {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "CodexConfig::validate",
-                "home owner must be 1..=64 lowercase ASCII letters, digits, or hyphens and must start and end with a letter or digit",
-            ));
-        }
         for (name, value) in [
             ("request_timeout", self.request_timeout),
             ("approval_timeout", self.approval_timeout),
@@ -179,27 +146,13 @@ impl CodexConfig {
     }
 }
 
-fn valid_home_owner(owner: &str) -> bool {
-    let bytes = owner.as_bytes();
-    (1..=64).contains(&bytes.len())
-        && bytes
-            .first()
-            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        && bytes
-            .last()
-            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn config_for_validation() -> CodexConfig {
         let runtime = RuntimePackage::pinned(".").expect("audited runtime lock");
-        CodexConfig::new(runtime, "vergerail-home")
+        CodexConfig::new(runtime)
     }
 
     #[test]
@@ -234,14 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_home_frame_limit_and_capacities() {
-        let mut config = config_for_validation();
-        config.codex_home = PathBuf::new();
-        assert_eq!(
-            config.validate().expect_err("empty home").kind(),
-            ErrorKind::InvalidInput
-        );
-
+    fn validates_frame_limit_and_capacities() {
         let mut config = config_for_validation();
         config.max_frame_bytes = 64 * 1024 - 1;
         assert_eq!(
@@ -253,12 +199,6 @@ mod tests {
         config.event_capacity = 0;
         assert_eq!(
             config.validate().expect_err("zero event capacity").kind(),
-            ErrorKind::InvalidInput
-        );
-
-        let config = config_for_validation().with_home_owner("other_owner");
-        assert_eq!(
-            config.validate().expect_err("invalid home owner").kind(),
             ErrorKind::InvalidInput
         );
     }

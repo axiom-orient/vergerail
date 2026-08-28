@@ -269,7 +269,7 @@ static int run_worker(int liveness, const char *ack_path, const char *ready_path
 }
 
 int main(int argc, char **argv) {
-    if (argc < 8 || strcmp(argv[1], "--legacy-ack") != 0 || strcmp(argv[3], "--wait-for") != 0 ||
+    if (argc < 8 || strcmp(argv[1], "--survivor-probe") != 0 || strcmp(argv[3], "--wait-for") != 0 ||
         strcmp(argv[5], "--") != 0) {
         return EXIT_USAGE;
     }

@@ -107,9 +107,7 @@ struct ExactText {
 
 #[derive(Debug)]
 struct RuntimeSettings {
-    codex_home: PathBuf,
     workspace: PathBuf,
-    home_owner: String,
     model: String,
     explicit_package: Option<PathBuf>,
     download_policy: DownloadPolicy,
@@ -322,7 +320,6 @@ fn read_request() -> Result<Vec<u8>, ProviderFailure> {
 
 impl RuntimeSettings {
     fn from_environment() -> Result<Self, ProviderFailure> {
-        let codex_home = required_path("VERGERAIL_CODEX_HOME")?;
         let workspace = required_path("VERGERAIL_WORKSPACE")?;
         let metadata = std::fs::metadata(&workspace).map_err(|_| {
             ProviderFailure::invalid_configuration(
@@ -337,7 +334,6 @@ impl RuntimeSettings {
         let workspace = workspace.canonicalize().map_err(|_| {
             ProviderFailure::invalid_configuration("VERGERAIL_WORKSPACE could not be canonicalized")
         })?;
-        let home_owner = required_text("VERGERAIL_HOME_OWNER", 64)?;
         let model = required_text("VERGERAIL_MODEL", 128)?;
         let explicit_package = env::var_os("VERGERAIL_CODEX_PACKAGE")
             .filter(|value| !value.is_empty())
@@ -376,9 +372,7 @@ impl RuntimeSettings {
             )));
         }
         Ok(Self {
-            codex_home,
             workspace,
-            home_owner,
             model,
             explicit_package,
             download_policy,
@@ -607,9 +601,7 @@ async fn execute(
     settings: RuntimeSettings,
 ) -> Result<SuccessEnvelope, ProviderFailure> {
     let runtime = resolve_runtime(&settings).await?;
-    let config = CodexConfig::new(runtime, &settings.codex_home)
-        .with_home_owner(settings.home_owner.clone())
-        .with_client_title("IFSC ScreenProgram Provider");
+    let config = CodexConfig::new(runtime).with_client_title("IFSC ScreenProgram Provider");
     let codex = Codex::connect(config).await.map_err(map_vergerail_error)?;
     let outcome = execute_connected(&codex, &request, &contract, &settings).await;
     let shutdown = codex.shutdown().await;
@@ -647,7 +639,7 @@ async fn execute_connected(
         } => {
             return Err(ProviderFailure::new(
                 "authentication-required",
-                "the dedicated Vergerail Codex home is signed out",
+                "the standard Codex account is signed out",
                 false,
                 1,
             )

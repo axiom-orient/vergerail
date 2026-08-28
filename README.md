@@ -2,26 +2,28 @@
 
 > Verified runtimes. Explicit authority.
 
-Vergerail은 Rust 애플리케이션에서 고정된 OpenAI Codex app-server를 로컬 자식 프로세스로 사용하는 라이브러리입니다. 검증된 runtime을 stdio JSONL로 연결하며, 범용 provider SDK·HTTP client·공개 daemon은 아닙니다. 저장소에는 정적 IFSC `ScreenProgram`용 `ifsc_text_provider`와 UpAgent의 `vergerail.provider/1` 계약을 제공하는 `vergerail_provider` one-shot binary도 있습니다.
+Vergerail은 Rust 애플리케이션에서 고정된 OpenAI Codex app-server를 로컬 자식 프로세스로 사용하는 라이브러리입니다. 검증된 runtime을 stdio JSONL로 연결하며 범용 provider SDK, HTTP client, 공개 daemon은 아닙니다. 저장소에는 IFSC `ScreenProgram`용 `ifsc_text_provider`와 UpAgent용 `vergerail_provider` one-shot binary도 포함됩니다.
 
-현재 checkout은 Apple silicon macOS에서 Codex `0.150.1`, Rust `1.97.1` 이상을 지원합니다. aarch64 Linux에서는 library와 `ifsc_text_provider`를 build·test·install하고 runtime에 접근하지 않는 typed input/error 경로를 실행할 수 있지만, 고정 runtime과 guardian은 macOS 전용이므로 `RuntimeResolver`/`Codex` 실행 지원을 뜻하지 않습니다. 이 프로젝트는 공개 GitHub source로 배포하며, `publish = false` 설정으로 crates.io에는 게시하지 않습니다. 상세 증거와 배포 조건은 [검증](docs/VERIFICATION.md)과 [배포](docs/RELEASE.md) 문서가 관리합니다.
+현재 지원 조합은 Apple silicon macOS, Codex `0.150.1`, Rust `1.97.1` 이상입니다. Linux에서는 runtime을 실행하지 않는 library와 provider의 정적 경로만 build·test할 수 있습니다. `publish = false`이므로 crates.io에는 게시하지 않습니다.
 
 ## 저장소 계약
 
-- 입력: `Cargo.toml`·`Cargo.lock`, `runtime/` lock, `protocol/` schema·provenance, library·IFSC·UpAgent provider 요청
-- 출력: Rust library API와 각 provider binary의 stdout JSON 한 값
-- 산출물: Cargo가 재생성하는 `target/`; source·credential·전용 `CODEX_HOME`과 분리
+- 입력: `Cargo.toml`·`Cargo.lock`, `runtime/` lock, `protocol/` schema·provenance, provider stdin JSON, caller가 지정한 workspace
+- 출력: Rust API의 typed event/result와 provider stdout의 JSON 값 하나
+- 산출물: `target/`, `package-check/`, coverage 파일과 OS 임시 파일; 모두 `scripts/clean.sh`로 재생성 가능하게 제거
+- 외부 사용자 상태: 표준 `~/.codex` 로그인과 Vergerail runtime cache; 저장소 산출물이 아니며 clean/package 대상이 아님
+
+저장소 스크립트는 두 개만 유지합니다.
 
 ```bash
 scripts/verify.sh
+scripts/verify.sh --release
 scripts/clean.sh
 ```
 
-`verify.sh`가 개발 중 기본 검증 진입점이고 `release-verify.sh`가 committed HEAD, clean tree, 지원 host와 실제 external proof 환경을 요구하는 배포 직전 진입점입니다. `clean.sh`가 repository-local 산출물을 제거합니다. GitHub Actions와 `.github/workflows`는 이 저장소에서 금지하며 verify 단계도 해당 경로가 있으면 실패합니다.
+`verify.sh`는 로컬 정적·테스트·package gate입니다. `--release`는 clean committed HEAD, 지원 host, 공식 runtime, 표준 ChatGPT 로그인과 live E2E를 추가로 요구합니다. GitHub Actions, `.github/workflows`, CI/CD 설정은 이 저장소에서 금지하며 verify도 해당 경로가 있으면 실패합니다.
 
 ## 설치
-
-소비자 crate에서 이 checkout을 상대경로로 참조합니다.
 
 ```toml
 [dependencies]
@@ -29,20 +31,16 @@ vergerail = { path = "../vergerail" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-`publish = false`는 crates.io 게시만 차단합니다. Git dependency는 canonical repository가 배포된 뒤 검증한 commit SHA로 고정해야 합니다.
-
-공개 GitHub source를 사용할 때는 mutable branch나 tag 대신 검증한 full commit SHA를 고정하세요.
+Git source는 mutable branch나 tag 대신 검증한 full commit SHA로 고정하세요.
 
 ```toml
 [dependencies]
 vergerail = { git = "https://github.com/axiom-orient/vergerail.git", rev = "<verified-full-commit-sha>" }
 ```
 
-canonical source: <https://github.com/axiom-orient/vergerail>
-
 ## 빠른 시작
 
-Vergerail 앱마다 비어 있는 전용 `CODEX_HOME`과 안정적인 lowercase owner ID를 사용하세요. 일반 `~/.codex` 또는 복사한 `auth.json`은 허용되지 않습니다.
+Vergerail은 별도 인증 저장소를 만들지 않습니다. app-server는 표준 `~/.codex`를 사용하므로 ChatGPT 앱 또는 `codex login`으로 이미 인증한 계정을 그대로 재사용합니다.
 
 ```rust,no_run
 use vergerail::{Account, Codex, CodexConfig, RuntimeResolver};
@@ -50,15 +48,10 @@ use vergerail::{Account, Codex, CodexConfig, RuntimeResolver};
 #[tokio::main]
 async fn main() -> vergerail::Result<()> {
     let runtime = RuntimeResolver::new().resolve().await?.into_package();
-    let codex_home = std::env::var_os("VERGERAIL_CODEX_HOME")
-        .expect("VERGERAIL_CODEX_HOME must be set");
-    let codex = Codex::connect(
-        CodexConfig::new(runtime, codex_home).with_home_owner("my-app"),
-    )
-    .await?;
+    let codex = Codex::connect(CodexConfig::new(runtime)).await?;
 
     match codex.account().await? {
-        Account::SignedOut { .. } => println!("로그인이 필요합니다"),
+        Account::SignedOut { .. } => println!("ChatGPT 또는 codex login으로 로그인하세요"),
         Account::ChatGpt { email, plan } => println!("{email:?} / {plan}"),
     }
 
@@ -66,87 +59,26 @@ async fn main() -> vergerail::Result<()> {
 }
 ```
 
-`RuntimeResolver::resolve()`는 기본적으로 터미널의 `codex`나 ChatGPT 앱 번들을 사용하지 않고 VergeRail 관리 cache에서 정확한 고정 runtime을 재사용하거나 공식 archive를 설치합니다. 외부의 완전한 감사 package를 재사용하려는 호출자만 `with_system_discovery(true)`를 명시해야 합니다. `Codex::connect()`는 전달받은 package를 재검증하고 실행하지만 설치를 시작하지 않습니다.
+`RuntimeResolver::resolve()`는 정확한 고정 runtime을 관리 cache에서 재사용하거나 공식 archive를 설치합니다. 외부의 완전한 감사 package를 재사용할 때만 `with_system_discovery(true)`를 명시합니다. `Codex::connect()`는 package를 재검증하고 실행하지만 설치를 시작하지 않습니다.
 
-## 로그인과 실행
+로그인이 필요하면 `Codex::login()`을 사용할 수 있습니다. OAuth URL 열기, 계정 선택, 승인과 MFA는 host와 사용자가 처리합니다. `Codex::logout()`은 공유하는 표준 Codex 계정을 로그아웃하므로 호출자는 그 영향을 명시적으로 소유해야 합니다.
 
-```rust,no_run
-use vergerail::{Codex, LoginMethod, SessionOptions};
+`Codex::run()`은 임시 read-only session에서 network를 끄고 approval을 자동 거부합니다. 파일 쓰기는 `SessionOptions::workspace_write()` persistent session에서만 요청할 수 있으며 caller가 event approval에 직접 응답해야 합니다. session은 `Session::close()`, client는 `Codex::shutdown()`으로 종료합니다.
 
-async fn login_and_run(codex: &Codex) -> vergerail::Result<String> {
-    if matches!(codex.account().await?, vergerail::Account::SignedOut { .. }) {
-        let login = codex.login(LoginMethod::Browser).await?;
-        println!("{}", login.auth_url().expect("browser login URL"));
-        login.wait().await?;
-    }
+## 이미지와 provider
 
-    let result = codex
-        .run("이 저장소의 테스트 실패 원인을 설명해 줘.", SessionOptions::read_only("."))
-        .await?;
-    Ok(result.text)
-}
-```
+이미지 생성은 기본적으로 꺼져 있습니다. `CodexConfig::new(runtime).with_image_generation(true)`로 명시적으로 활성화하며 `Event::ImageGeneration`, `RunResult::image_generations`, `Session::audit_turn()`을 함께 검증합니다.
 
-URL 열기, 계정 선택, OAuth 승인과 MFA는 host 애플리케이션과 사용자가 처리합니다. `Codex::run()`은 임시 read-only session에서 network를 끄고 approval을 자동 거부합니다. 파일 쓰기는 `SessionOptions::workspace_write()` persistent session에서만 요청할 수 있으며 caller가 event approval에 직접 응답해야 합니다.
+`ifsc_text_provider`는 read-only text-only session에서 정적 `ScreenProgram` JSON을 반환합니다. `vergerail_provider`는 고정 runtime package, model, read-only workspace를 환경으로 받아 `model_turn` 또는 `image_generate` 한 번을 처리합니다. 두 provider 모두 표준 Codex 로그인을 재사용하며 credential 파일을 읽거나 복사하지 않습니다.
 
-session을 마치면 `Session::close()`, client 전체는 `Codex::shutdown()`으로 종료합니다. 완료된 persistent turn의 durable effect는 session을 닫기 전에 `Session::audit_turn()`으로 검사합니다.
-
-## 이미지 생성
-
-이미지 생성은 기본적으로 꺼져 있습니다. 전용 home을 연결할 때 명시적으로 활성화하면 `Event::ImageGeneration`으로 수명주기를 관찰하고, terminal `RunResult::image_generations`에서 item ID별 최신 상태와 base64 결과를 받을 수 있습니다. persistent session의 `TurnAudit::image_generations`와 대조하면 live 결과가 durable history와 일치하는지도 확인할 수 있습니다.
-
-```rust,no_run
-use vergerail::{Codex, CodexConfig, RuntimePackage, SessionOptions};
-
-async fn generate(
-    runtime: RuntimePackage,
-    codex_home: impl Into<std::path::PathBuf>,
-) -> vergerail::Result<()> {
-    let codex = Codex::connect(
-        CodexConfig::new(runtime, codex_home)
-            .with_home_owner("image-app")
-            .with_image_generation(true),
-    )
-    .await?;
-    let result = codex
-        .run(
-            "Generate one square PNG of a green circle on a navy background.",
-            SessionOptions::read_only(".").with_maximum_output_bytes(32 * 1024 * 1024),
-        )
-        .await?;
-    assert_eq!(result.image_generations.len(), 1);
-    codex.shutdown().await
-}
-```
-
-세션의 retained-output 제한은 assistant text와 image item metadata/base64의 합계에 적용됩니다. 실계정 E2E는 생성 bytes를 임시 파일로만 디코딩하고 별도 `perfectpixel inspect` 실행으로 PNG/JPEG/WebP 디코딩, 크기와 foreground 존재를 검증합니다.
-
-## Text-only adapter
-
-text adapter는 `SessionOptions::read_only(...).text_only()`와 전용 base/developer instruction을 사용해야 합니다. 이 설정은 실행·외부 context surface를 끄지만 sandbox를 대체하지 않으므로 live event와 durable audit을 함께 확인해야 합니다.
-
-`ifsc_text_provider`의 환경, stdin/stdout schema와 실패 의미는 [IFSC provider 계약](docs/IFSC_TEXT_PROVIDER.md)을 따릅니다.
-
-UpAgent는 `vergerail_provider`를 한 요청당 한 프로세스로 실행합니다. 이 binary는 managed home, audited runtime package, owner, model, read-only workspace를 환경으로 명시적으로 받아 `model_turn` 또는 `image_generate` 한 번만 처리합니다. 모델 응답은 native `outputSchema`와 text-only mode를, 이미지는 image-only mode와 persistent audit을 사용합니다. wire reasoning은 `off`, `low`, `medium`, `high`, `xhigh`, `max`이며 자세한 실패·상한 계약은 [UpAgent provider 계약](docs/PROVIDER_CONTRACT.md)을 따릅니다.
-
-## 주요 API
+## 주요 API와 문서
 
 - 연결·실행: `Codex`, `CodexConfig`, `Session`, `Run`, `SessionOptions`, `Sandbox`
 - 계정·모델: `Account`, `Login`, `LoginMethod`, `Model`
-- 이벤트·결과: `Event`, `RunResult`, `ImageGeneration`, `ImageGenerationFailure`, `TurnStatus`, `TurnAudit`, `Usage`, `Diagnostic`
+- 이벤트·결과: `Event`, `RunResult`, `ImageGeneration`, `TurnAudit`, `Usage`, `Diagnostic`
 - runtime: `RuntimeResolver`, `RuntimePackage`, `ResolvedRuntime`, `RuntimeOrigin`, `DownloadPolicy`
 - 오류: `Error`, `ErrorKind`, `Result`; 비멱등 결과가 불명확하면 `OutcomeUnknown`
 
-전체 public surface는 [src/lib.rs](src/lib.rs)가 기준입니다.
-
-## 문서
-
-- [아키텍처](docs/ARCHITECTURE.md): 책임, 상태 owner, 시작·종료 흐름
-- [프로토콜 계약](docs/PROTOCOL_CONTRACT.md): wire, sandbox, 재시도와 terminal 의미
-- [IFSC provider 계약](docs/IFSC_TEXT_PROVIDER.md): command 환경, schema와 실패 의미
-- [UpAgent provider 계약](docs/PROVIDER_CONTRACT.md): one-shot JSONL, 모델·이미지 출력과 실패 의미
-- [검증](docs/VERIFICATION.md): 로컬·runtime·실계정 검증 명령과 현재 증거
-- [배포](docs/RELEASE.md): GitHub와 crates.io gate
-- [보안](SECURITY.md): 지원 경계와 credential 취급
+전체 public surface는 [src/lib.rs](src/lib.rs)가 기준입니다. 세부 경계는 [아키텍처](docs/ARCHITECTURE.md), [프로토콜](docs/PROTOCOL_CONTRACT.md), [IFSC provider](docs/IFSC_TEXT_PROVIDER.md), [UpAgent provider](docs/PROVIDER_CONTRACT.md), [검증](docs/VERIFICATION.md), [보안](SECURITY.md)을 따릅니다.
 
 라이선스는 Apache-2.0입니다.

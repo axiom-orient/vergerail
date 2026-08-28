@@ -1,4 +1,4 @@
-use crate::config::{CodexConfig, ManagedHome};
+use crate::config::CodexConfig;
 use crate::error::{Error, ErrorKind, Result};
 use crate::private::codec::{EncodedFrame, JsonLinesReader, JsonLinesWriter};
 use crate::private::process_tree;
@@ -53,6 +53,7 @@ struct ProcessInner {
     child: Mutex<Option<Child>>,
     identity: process_tree::ProcessIdentity,
     guardian_path: std::path::PathBuf,
+    guardian_directory: std::path::PathBuf,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
     stderr: Arc<StderrCapture>,
     shutdown_started: AtomicBool,
@@ -69,6 +70,16 @@ impl ProcessInner {
         self.tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for ProcessInner {
+    fn drop(&mut self) {
+        // The owned child has kill-on-drop. Unlink the per-run executable and
+        // directory as a final synchronous guard when a Tokio runtime is torn
+        // down before asynchronous shutdown can finish.
+        let _ = process_tree::remove_guardian(&self.guardian_path);
+        let _ = process_tree::remove_guardian_directory(&self.guardian_directory);
     }
 }
 
@@ -120,25 +131,36 @@ impl StderrCapture {
 impl ProcessHandle {
     pub(crate) async fn spawn(
         runtime: &VerifiedRuntime,
-        home: &Arc<ManagedHome>,
         config: &CodexConfig,
     ) -> Result<(Self, mpsc::Receiver<ProcessEvent>)> {
-        let guardian_path =
-            process_tree::extract_guardian(&home.neutral_workdir()).map_err(|error| {
-                Error::new(
+        let guardian_directory =
+            process_tree::create_guardian_directory(&env::temp_dir(), "vergerail-runtime")
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::Process,
+                        "process.guardian",
+                        format!("cannot create a private guardian directory: {error}"),
+                    )
+                })?;
+        let guardian_path = match process_tree::extract_guardian(&guardian_directory) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = process_tree::remove_guardian_directory(&guardian_directory);
+                return Err(Error::new(
                     ErrorKind::Process,
                     "process.guardian",
                     format!("cannot materialize the audited macOS guardian: {error}"),
-                )
-            })?;
+                ));
+            }
+        };
         let mut command = process_tree::command(&guardian_path, &runtime.entrypoint);
         command
             .arg("app-server")
             .arg("--listen")
             .arg("stdio://")
             .arg("--strict-config")
-            .current_dir(home.neutral_workdir())
-            .env("CODEX_HOME", home.root())
+            .current_dir(env::temp_dir())
+            .env_remove("CODEX_HOME")
             .env("LOG_FORMAT", "json")
             .env("NO_COLOR", "1")
             .env("TERM", "dumb")
@@ -173,6 +195,7 @@ impl ProcessHandle {
         }
         let path = env::join_paths(path_segments).map_err(|error| {
             let _ = process_tree::remove_guardian(&guardian_path);
+            let _ = process_tree::remove_guardian_directory(&guardian_directory);
             Error::new(
                 ErrorKind::Process,
                 "process.environment",
@@ -185,6 +208,7 @@ impl ProcessHandle {
             Ok(child) => child,
             Err(error) => {
                 let _ = process_tree::remove_guardian(&guardian_path);
+                let _ = process_tree::remove_guardian_directory(&guardian_directory);
                 return Err(Error::new(
                     ErrorKind::Process,
                     "process.spawn",
@@ -198,6 +222,7 @@ impl ProcessHandle {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 let _ = process_tree::remove_guardian(&guardian_path);
+                let _ = process_tree::remove_guardian_directory(&guardian_directory);
                 return Err(Error::new(
                     ErrorKind::Process,
                     "process.spawn",
@@ -211,6 +236,7 @@ impl ProcessHandle {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 let _ = process_tree::remove_guardian(&guardian_path);
+                let _ = process_tree::remove_guardian_directory(&guardian_directory);
                 return Err(Error::new(
                     ErrorKind::Process,
                     "process.spawn",
@@ -224,6 +250,7 @@ impl ProcessHandle {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 let _ = process_tree::remove_guardian(&guardian_path);
+                let _ = process_tree::remove_guardian_directory(&guardian_directory);
                 return Err(Error::new(
                     ErrorKind::Process,
                     "process.spawn",
@@ -237,6 +264,7 @@ impl ProcessHandle {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 let _ = process_tree::remove_guardian(&guardian_path);
+                let _ = process_tree::remove_guardian_directory(&guardian_directory);
                 return Err(Error::new(
                     ErrorKind::Process,
                     "process.spawn",
@@ -253,6 +281,7 @@ impl ProcessHandle {
             child: Mutex::new(Some(child)),
             identity,
             guardian_path,
+            guardian_directory,
             tasks: StdMutex::new(Vec::new()),
             stderr: Arc::clone(&stderr_capture),
             shutdown_started: AtomicBool::new(false),
@@ -434,6 +463,10 @@ impl ProcessHandle {
         if let Err(error) = process_tree::remove_guardian(&self.inner.guardian_path) {
             failures.push(format!("failed to remove guardian helper: {error}"));
         }
+        if let Err(error) = process_tree::remove_guardian_directory(&self.inner.guardian_directory)
+        {
+            failures.push(format!("failed to remove guardian directory: {error}"));
+        }
 
         self.inner.cleanup_finished.store(true, Ordering::Release);
         if failures.is_empty() {
@@ -473,6 +506,15 @@ impl ProcessHandle {
                         format!("failed to remove guardian helper: {error}"),
                     )
                 })?;
+                process_tree::remove_guardian_directory(&self.inner.guardian_directory).map_err(
+                    |error| {
+                        Error::new(
+                            ErrorKind::Process,
+                            "process.kill",
+                            format!("failed to remove guardian directory: {error}"),
+                        )
+                    },
+                )?;
                 Ok(())
             }
             Ok(Err(error)) => Err(Error::new(
@@ -514,6 +556,7 @@ impl ProcessHandle {
             child: Mutex::new(None),
             identity: process_tree::ProcessIdentity::none(),
             guardian_path: std::path::PathBuf::new(),
+            guardian_directory: std::path::PathBuf::new(),
             tasks: StdMutex::new(Vec::new()),
             stderr,
             shutdown_started: AtomicBool::new(false),

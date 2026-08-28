@@ -3,12 +3,10 @@
 vergerail_provider is the versioned process boundary used by UpAgent. It
 reads exactly one UTF-8 JSON request from stdin and writes exactly one JSON
 response to stdout. It never reads an auth file, copies a token, or retries a
-request. The managed home, pinned runtime package, owner, model, and workspace
-are explicit environment configuration:
+request. It reuses the standard Codex account state. The pinned runtime
+package, model, and workspace are explicit environment configuration:
 
-* VERGERAIL_CODEX_HOME
 * VERGERAIL_CODEX_PACKAGE
-* VERGERAIL_HOME_OWNER
 * VERGERAIL_MODEL
 * VERGERAIL_WORKSPACE
 

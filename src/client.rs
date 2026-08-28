@@ -3,7 +3,7 @@
 mod router;
 
 use crate::account::{Account, Login, LoginMethod, LoginRegistry, LoginWait};
-use crate::config::{CodexConfig, ManagedHome};
+use crate::config::CodexConfig;
 use crate::error::{Error, ErrorKind, Result};
 use crate::event::{Diagnostic, DiagnosticBuffer, RunResult, TurnAudit};
 use crate::model::Model;
@@ -23,7 +23,7 @@ use crate::session::{
 };
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use tokio::task::JoinHandle;
@@ -36,7 +36,6 @@ pub struct Codex {
 
 pub(crate) struct ClientInner {
     config: CodexConfig,
-    home: Arc<ManagedHome>,
     process: ProcessHandle,
     requests: RequestRegistry,
     runs: RunRegistry,
@@ -200,21 +199,14 @@ impl Drop for KnownTurnGuard {
 }
 
 impl Codex {
-    /// Verifies the exact runtime package, prepares an isolated Codex home, starts
-    /// app-server, and completes the stable initialize handshake.
+    /// Verifies the exact runtime package, starts app-server with the standard
+    /// Codex account, and completes the stable initialize handshake.
     pub async fn connect(config: CodexConfig) -> Result<Self> {
         config.validate()?;
         let runtime = config.runtime.verify().await?;
-        let home = ManagedHome::prepare_with_features(
-            config.codex_home.clone(),
-            config.home_owner.clone(),
-            config.image_generation,
-        )
-        .await?;
-        let (process, process_events) = ProcessHandle::spawn(&runtime, &home, &config).await?;
+        let (process, process_events) = ProcessHandle::spawn(&runtime, &config).await?;
         let inner = Arc::new(ClientInner {
             config,
-            home,
             process,
             requests: RequestRegistry::new(),
             runs: RunRegistry::new(),
@@ -249,7 +241,7 @@ impl Codex {
         self.inner.login(method).await
     }
 
-    /// Logs out the managed account in the dedicated Codex home.
+    /// Logs out the shared standard Codex account.
     pub async fn logout(&self) -> Result<()> {
         self.inner.logout().await
     }
@@ -423,9 +415,7 @@ impl ClientInner {
             Some(other) => Err(Error::new(
                 ErrorKind::Authentication,
                 "account.read",
-                format!(
-                    "dedicated Codex home is authenticated with unsupported account type '{other}'"
-                ),
+                format!("the standard Codex account uses unsupported account type '{other}'"),
             )),
             None => Err(protocol_field("account.read", "account.type")),
         }
@@ -643,11 +633,7 @@ impl ClientInner {
                 "image-only sessions require CodexConfig::with_image_generation(true)",
             ));
         }
-        let cwd = if options.is_text_only() || options.is_image_only() {
-            self.home.validate_transient_project(options.cwd()).await?
-        } else {
-            self.home.register_untrusted_project(options.cwd()).await?
-        };
+        let cwd = canonical_project(options.cwd()).await?;
         let response = self
             .request(
                 "thread/start",
@@ -728,11 +714,7 @@ impl ClientInner {
                 "thread is already loaded by this client",
             ));
         }
-        let cwd = if options.is_text_only() || options.is_image_only() {
-            self.home.validate_transient_project(options.cwd()).await?
-        } else {
-            self.home.register_untrusted_project(options.cwd()).await?
-        };
+        let cwd = canonical_project(options.cwd()).await?;
         let response = self
             .request(
                 "thread/resume",
@@ -1592,6 +1574,38 @@ fn thread_config(text_only: bool, image_only: bool) -> Value {
             "use_memories": false
         }
     })
+}
+
+async fn canonical_project(cwd: &Path) -> Result<PathBuf> {
+    let metadata = tokio::fs::symlink_metadata(cwd).await.map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "session.cwd",
+            format!("cannot inspect {}: {error}", cwd.display()),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "session.cwd",
+            "working directory must be a real, non-symlink directory",
+        ));
+    }
+    let canonical = tokio::fs::canonicalize(cwd).await.map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "session.cwd",
+            format!("cannot canonicalize {}: {error}", cwd.display()),
+        )
+    })?;
+    if canonical.to_str().is_none() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "session.cwd",
+            "working directory must be valid UTF-8 for the protocol boundary",
+        ));
+    }
+    Ok(canonical)
 }
 
 #[cfg(test)]

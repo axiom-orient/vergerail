@@ -5,7 +5,7 @@
 - Use `scripts/clean.sh` to remove repository-local generated artifacts.
 - Keep runtime locks and protocol provenance as immutable inputs; never edit generated schemas by hand.
 - Keep one canonical API and state format. Do not add compatibility aliases, migration adapters, deprecated shims, or silent fallbacks.
-- Do not commit `target/`, credentials, dedicated `CODEX_HOME` state, logs, caches, or temporary files.
+- Do not commit `target/`, credentials, standard `~/.codex` state, logs, caches, or temporary files.
 
 ## Project profile
 

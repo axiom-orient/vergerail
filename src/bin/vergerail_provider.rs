@@ -215,34 +215,20 @@ struct ProviderFailure {
 
 #[derive(Debug, Clone)]
 struct ProviderConfig {
-    codex_home: PathBuf,
     runtime_package: PathBuf,
-    home_owner: String,
     model: String,
     workspace: PathBuf,
 }
 
 impl ProviderConfig {
     fn from_environment() -> ProviderResult<Self> {
-        let codex_home = required_path("VERGERAIL_CODEX_HOME")?;
         let runtime_package = required_path("VERGERAIL_CODEX_PACKAGE")?;
-        let home_owner = required_string("VERGERAIL_HOME_OWNER")?;
         let model = required_string("VERGERAIL_MODEL")?;
         let workspace = required_path("VERGERAIL_WORKSPACE")?;
-        if !absolute_clean_path(&codex_home)
-            || !absolute_clean_path(&runtime_package)
-            || !absolute_clean_path(&workspace)
-        {
+        if !absolute_clean_path(&runtime_package) || !absolute_clean_path(&workspace) {
             return Err(failure(
                 "invalid_configuration",
-                "managed home, runtime package, and workspace must be absolute paths without parent traversal",
-                false,
-            ));
-        }
-        if !valid_home_owner(&home_owner) {
-            return Err(failure(
-                "invalid_configuration",
-                "home owner must match [a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?",
+                "runtime package and workspace must be absolute paths without parent traversal",
                 false,
             ));
         }
@@ -254,9 +240,7 @@ impl ProviderConfig {
             ));
         }
         Ok(Self {
-            codex_home,
             runtime_package,
-            home_owner,
             model,
             workspace,
         })
@@ -296,22 +280,6 @@ fn absolute_clean_path(path: &std::path::Path) -> bool {
         && !path
             .components()
             .any(|component| component == Component::ParentDir)
-}
-
-fn valid_home_owner(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    let valid_alnum = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
-    match bytes {
-        [only] => valid_alnum(*only),
-        [first, middle @ .., last] if (2..=64).contains(&bytes.len()) => {
-            valid_alnum(*first)
-                && valid_alnum(*last)
-                && middle
-                    .iter()
-                    .all(|byte| valid_alnum(*byte) || *byte == b'-')
-        }
-        _ => false,
-    }
 }
 
 fn failure(code: &'static str, message: &str, retryable: bool) -> ProviderFailure {
@@ -750,7 +718,7 @@ async fn async_run_request(
         )
     })?;
     let enable_images = request.operation == ProviderOperation::ImageGenerate;
-    let codex = connect(runtime, &config, enable_images).await?;
+    let codex = connect(runtime, enable_images).await?;
     let operation = match request.operation {
         ProviderOperation::ModelTurn => run_model_turn(&codex, &config, &request).await,
         ProviderOperation::ImageGenerate => run_image_generation(&codex, &config, &request).await,
@@ -774,14 +742,9 @@ async fn async_run_request(
     }
 }
 
-async fn connect(
-    runtime: RuntimePackage,
-    config: &ProviderConfig,
-    enable_images: bool,
-) -> ProviderResult<Codex> {
+async fn connect(runtime: RuntimePackage, enable_images: bool) -> ProviderResult<Codex> {
     Codex::connect(
-        CodexConfig::new(runtime, &config.codex_home)
-            .with_home_owner(&config.home_owner)
+        CodexConfig::new(runtime)
             .with_image_generation(enable_images)
             .with_max_frame_bytes(if enable_images {
                 MAX_IMAGE_FRAME_BYTES
