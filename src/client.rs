@@ -8,7 +8,7 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::event::{Diagnostic, DiagnosticBuffer, RunResult, TurnAudit};
 use crate::image::{
     ChatGptImageAuth, DirectImageRequest, DirectImageResponse, ImageEndpointError,
-    generate_via_endpoint,
+    ImageOperationState, generate_via_endpoint,
 };
 use crate::model::Model;
 use crate::private::connection::ConnectionLifecycle;
@@ -162,6 +162,47 @@ struct KnownTurnGuard {
     armed: bool,
 }
 
+struct ImageOperationGuard {
+    inner: Weak<ClientInner>,
+    operation: Arc<ImageOperationState>,
+    turn_id: String,
+    armed: bool,
+}
+
+impl ImageOperationGuard {
+    fn new(inner: &Arc<ClientInner>, operation: Arc<ImageOperationState>, turn_id: String) -> Self {
+        Self {
+            inner: Arc::downgrade(inner),
+            operation,
+            turn_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ImageOperationGuard {
+    fn drop(&mut self) {
+        if !self.armed || !self.operation.cancel() {
+            return;
+        }
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let error = self.operation.cancellation_error(&self.turn_id);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                inner.disconnect(error).await;
+            });
+        } else {
+            inner.begin_force_shutdown();
+        }
+    }
+}
+
 impl KnownTurnGuard {
     fn new(inner: &Arc<ClientInner>, thread_id: &str, turn_id: &str) -> Self {
         Self {
@@ -210,7 +251,10 @@ impl Codex {
     /// Codex account, and completes the stable initialize handshake.
     pub async fn connect(config: CodexConfig) -> Result<Self> {
         config.validate()?;
-        let runtime = config.runtime.verify().await?;
+        let runtime = match config.absolute_deadline {
+            Some(deadline) => config.runtime.verify_with_deadline(deadline).await?,
+            None => config.runtime.verify().await?,
+        };
         let (process, process_events) = ProcessHandle::spawn(&runtime, &config).await?;
         let inner = Arc::new(ClientInner {
             config,
@@ -355,16 +399,63 @@ impl Codex {
     }
 }
 
-fn remaining_timeout(deadline: Instant) -> std::time::Duration {
+fn require_remaining_timeout(deadline: Instant) -> Result<std::time::Duration> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        std::time::Duration::from_millis(1)
+        Err(Error::timeout("image.generate", std::time::Duration::ZERO))
     } else {
-        remaining
+        Ok(remaining)
     }
 }
 
 impl ClientInner {
+    fn remaining_timeout(
+        &self,
+        requested: std::time::Duration,
+        operation: &'static str,
+    ) -> Result<std::time::Duration> {
+        let Some(deadline) = self.config.absolute_deadline else {
+            return Ok(requested);
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::timeout(operation, requested));
+        }
+        Ok(remaining.min(requested))
+    }
+
+    fn remaining_shutdown_timeout(&self) -> std::time::Duration {
+        self.config
+            .absolute_deadline
+            .map(|deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(self.config.shutdown_timeout)
+            })
+            .unwrap_or(self.config.shutdown_timeout)
+    }
+
+    fn operation_deadline_expired(&self) -> bool {
+        self.config
+            .absolute_deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+    }
+
+    fn cleanup_deadline(&self) -> Instant {
+        let now = Instant::now();
+        let budget_deadline = now.checked_add(self.config.shutdown_timeout).unwrap_or(now);
+        match self.config.absolute_deadline {
+            Some(operation_deadline) if operation_deadline > now => {
+                operation_deadline.min(budget_deadline)
+            }
+            _ => budget_deadline,
+        }
+    }
+
+    fn remaining_cleanup_timeout(cleanup_deadline: Instant) -> std::time::Duration {
+        cleanup_deadline.saturating_duration_since(Instant::now())
+    }
+
     fn router_task(&self) -> MutexGuard<'_, Option<JoinHandle<()>>> {
         // The mutex protects only handle ownership. Shutdown takes the handle
         // out before awaiting the task.
@@ -671,7 +762,22 @@ impl ClientInner {
                 "image prompt exceeds the bounded UTF-8 limit",
             ));
         }
-        let deadline = Instant::now() + self.config.request_timeout;
+        let deadline = match self.config.absolute_deadline {
+            Some(deadline) => deadline,
+            None => Instant::now()
+                .checked_add(self.config.request_timeout)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        "image.generate",
+                        "image request timeout cannot be represented by the monotonic clock",
+                    )
+                })?,
+        };
+        let turn_id = crate::image::image_turn_id();
+        let operation = ImageOperationState::new();
+        let mut operation_guard =
+            ImageOperationGuard::new(self, Arc::clone(&operation), turn_id.clone());
         let image_endpoint = self
             .image_endpoint
             .lock()
@@ -680,18 +786,27 @@ impl ClientInner {
         generate_image_with_retry(
             request,
             deadline,
+            turn_id,
+            Arc::clone(&operation),
             |refresh, request_timeout| self.image_auth(refresh, request_timeout),
-            |auth, request, request_timeout, turn_id| {
+            move |auth, request, request_timeout, turn_id| {
                 generate_via_endpoint(
                     image_endpoint.clone(),
                     auth,
                     request,
                     request_timeout,
                     turn_id,
+                    Arc::clone(&operation),
                 )
             },
         )
         .await
+        .inspect(|_| operation_guard.disarm())
+        .inspect_err(|error| {
+            if error.kind() != ErrorKind::OutcomeUnknown {
+                operation_guard.disarm();
+            }
+        })
     }
 
     async fn image_auth(
@@ -1238,7 +1353,8 @@ impl ClientInner {
                 }
             }
         };
-        timeout(self.config.shutdown_timeout, wait)
+        let shutdown_timeout = self.remaining_shutdown_timeout();
+        timeout(shutdown_timeout, wait)
             .await
             .map_err(|_| {
                 Error::new(
@@ -1246,7 +1362,7 @@ impl ClientInner {
                     "turn.completed",
                     format!(
                         "turn '{turn_id}' for thread '{thread_id}' did not reach a provider terminal state within {} ms after interruption",
-                        self.config.shutdown_timeout.as_millis()
+                        shutdown_timeout.as_millis()
                     ),
                 )
             })?
@@ -1439,6 +1555,7 @@ impl ClientInner {
         allow_closing: bool,
         request_timeout: std::time::Duration,
     ) -> Result<Value> {
+        let request_timeout = self.remaining_timeout(request_timeout, operation)?;
         if self.connection.is_closing() && !allow_closing {
             return Err(Error::new(
                 ErrorKind::Shutdown,
@@ -1539,16 +1656,15 @@ impl ClientInner {
         if !self.connection.begin_closing() {
             return Ok(());
         }
-        let _lifecycle = self.sessions.lock_lifecycle().await;
-        let sessions = self.sessions.snapshot();
         let mut failures = Vec::new();
-        if self.connection.is_disconnected() {
+        if self.connection.is_disconnected() || self.operation_deadline_expired() {
             // A forced disconnect has already terminated the process, so remote
-            // threads no longer exist. Avoid issuing meaningless RPCs against a
-            // dead transport while still joining and checking local resources.
+            // threads no longer exist. An expired operation deadline likewise
+            // skips remote cleanup and goes straight to bounded local reap.
             self.sessions.clear();
         } else {
-            for thread_id in sessions {
+            let _lifecycle = self.sessions.lock_lifecycle().await;
+            for thread_id in self.sessions.snapshot() {
                 let active_turn = self.runs.active_turn(&thread_id);
                 if let Some((turn_id, control)) = active_turn
                     && let Err(error) = self
@@ -1577,12 +1693,13 @@ impl ClientInner {
                 }
             }
         }
-        if let Err(error) = self.process.shutdown().await {
+        let cleanup_deadline = self.cleanup_deadline();
+        if let Err(error) = self.process.shutdown_with_deadline(cleanup_deadline).await {
             failures.push(error.to_string());
         }
         let router_task = self.router_task().take();
         if let Some(mut task) = router_task {
-            match timeout(self.config.shutdown_timeout, &mut task).await {
+            match timeout(Self::remaining_cleanup_timeout(cleanup_deadline), &mut task).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => failures.push(format!("router task failed: {error}")),
                 Err(_) => {
@@ -1645,7 +1762,12 @@ impl ClientInner {
         if !self.connection.begin_disconnect(error.clone()) {
             return;
         }
-        if let Err(termination) = self.process.force_kill().await {
+        let cleanup_deadline = self.cleanup_deadline();
+        if let Err(termination) = self
+            .process
+            .force_kill_with_deadline(cleanup_deadline)
+            .await
+        {
             error = Error::new(
                 error.kind(),
                 error.operation(),
@@ -1655,7 +1777,7 @@ impl ClientInner {
                 ),
             );
         }
-        error = error.with_stderr(self.process.stderr_tail_after_close().await);
+        error = error.with_stderr(self.process.stderr_tail_after_close(cleanup_deadline).await);
         self.connection.replace_failure(error.clone());
 
         self.requests.fail_all(&error);
@@ -1669,6 +1791,8 @@ impl ClientInner {
 async fn generate_image_with_retry<AuthFactory, AuthFuture, EndpointFactory, EndpointFuture>(
     request: DirectImageRequest,
     deadline: Instant,
+    turn_id: String,
+    operation: Arc<ImageOperationState>,
     mut auth_factory: AuthFactory,
     mut endpoint_factory: EndpointFactory,
 ) -> Result<DirectImageResponse>
@@ -1679,20 +1803,38 @@ where
         FnMut(ChatGptImageAuth, DirectImageRequest, std::time::Duration, String) -> EndpointFuture,
     EndpointFuture: Future<Output = std::result::Result<DirectImageResponse, ImageEndpointError>>,
 {
-    let turn_id = crate::image::image_turn_id();
-    let auth = auth_factory(true, remaining_timeout(deadline)).await?;
+    if operation.is_cancelled() {
+        return Err(operation.cancellation_error(&turn_id));
+    }
+    let auth = auth_factory(true, require_remaining_timeout(deadline)?).await?;
+    if operation.is_cancelled() {
+        return Err(operation.cancellation_error(&turn_id));
+    }
     match endpoint_factory(
         auth,
         request.clone(),
-        remaining_timeout(deadline),
+        require_remaining_timeout(deadline)?,
         turn_id.clone(),
     )
     .await
     {
         Ok(response) => Ok(response),
         Err(ImageEndpointError::Unauthorized) => {
-            let refreshed = auth_factory(true, remaining_timeout(deadline)).await?;
-            match endpoint_factory(refreshed, request, remaining_timeout(deadline), turn_id).await {
+            if operation.is_cancelled() {
+                return Err(operation.cancellation_error(&turn_id));
+            }
+            let refreshed = auth_factory(true, require_remaining_timeout(deadline)?).await?;
+            if operation.is_cancelled() {
+                return Err(operation.cancellation_error(&turn_id));
+            }
+            match endpoint_factory(
+                refreshed,
+                request,
+                require_remaining_timeout(deadline)?,
+                turn_id,
+            )
+            .await
+            {
                 Ok(response) => Ok(response),
                 Err(ImageEndpointError::Unauthorized) => Err(Error::new(
                     ErrorKind::Authentication,
@@ -1893,7 +2035,6 @@ mod waiter_guard_tests {
             }
         };
         let request = DirectImageRequest {
-            model: "gpt-image-1".to_owned(),
             prompt: "test image".to_owned(),
             background: crate::image::ImageBackground::Transparent,
             size: crate::image::ImageSize::Square,
@@ -1902,6 +2043,8 @@ mod waiter_guard_tests {
         let error = generate_image_with_retry(
             request,
             Instant::now() + std::time::Duration::from_secs(1),
+            "test-image-turn".to_owned(),
+            ImageOperationState::new(),
             auth_factory,
             endpoint_factory,
         )

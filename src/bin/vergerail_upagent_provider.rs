@@ -2,29 +2,30 @@
 //!
 //! The process owns no credentials. It accepts a provider-neutral turn or an
 //! image-generation request on stdin, runs one read-only/text-only Vergerail
-//! operation against the explicitly configured managed Codex home, and emits
-//! one strict JSON response on stdout. A caller that cannot observe the
+//! operation against the standard Codex account, and emits one strict JSON
+//! response on stdout. A caller that cannot observe the
 //! result must resolve the outcome; this binary never retries a request.
 
 #![forbid(unsafe_code)]
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
-use std::io::{self, Read as _, Write as _};
-use std::path::Component;
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::future::Future;
+use std::io::{self, Read as _, Write};
+use std::path::{Component, PathBuf};
 use std::time::Duration;
+use std::time::Instant;
+use tokio::time::timeout;
 use vergerail::{
     Codex, CodexConfig, DirectImageRequest, ImageBackground, ImageQuality, ImageSize,
     ReasoningEffort, RuntimePackage, SessionOptions, TurnStatus,
 };
 
 const PROTOCOL_VERSION: u32 = 1;
-const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REQUEST_BYTES: usize = CodexConfig::MAX_FRAME_BYTES;
 const MAX_MESSAGE_BYTES: usize = 128 * 1024;
 const MAX_MESSAGES: usize = 128;
 const MAX_TOOLS: usize = 64;
@@ -39,11 +40,13 @@ const MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
 // The retained assistant body is JSON, so an 8 MiB decoded string can expand
 // to six bytes per scalar. Keep the native output frame and retained-output
 // bound aligned with UpAgent's 64 MiB model response frame.
-const MAX_MODEL_SESSION_BYTES: usize = 64 * 1024 * 1024;
-const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MODEL_SESSION_BYTES: usize = CodexConfig::MAX_FRAME_BYTES;
 const MAX_FAILURE_MESSAGE_BYTES: usize = 4 * 1024;
 const MAX_FAILURE_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_PROVIDER_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
+// This cleanup budget begins only after the user-visible provider deadline.
+// It is deliberately separate from timeoutMs and bounds the final reap.
+const PROVIDER_TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
 const JSON_STRING_MAX_EXPANSION: usize = 6;
 const MODEL_RESPONSE_HEADROOM_BYTES: usize = 256 * 1024;
 const MODEL_TOOL_CALL_WRAPPER_BYTES: usize = 128;
@@ -232,7 +235,7 @@ struct ImageResponse {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProviderImage {
-    media_type: &'static str,
+    media_type: String,
     base64: String,
     byte_length: usize,
     width: u32,
@@ -268,7 +271,6 @@ struct ProviderFailure {
 #[derive(Debug, Clone)]
 struct ProviderConfig {
     runtime_package: PathBuf,
-    codex_home: PathBuf,
     model: String,
     workspace: PathBuf,
 }
@@ -276,16 +278,12 @@ struct ProviderConfig {
 impl ProviderConfig {
     fn from_environment() -> ProviderResult<Self> {
         let runtime_package = required_path("VERGERAIL_CODEX_PACKAGE")?;
-        let codex_home = required_path("VERGERAIL_CODEX_HOME")?;
         let model = required_string("VERGERAIL_MODEL")?;
         let workspace = required_path("VERGERAIL_WORKSPACE")?;
-        if !absolute_clean_path(&runtime_package)
-            || !absolute_clean_path(&codex_home)
-            || !absolute_clean_path(&workspace)
-        {
+        if !absolute_clean_path(&runtime_package) || !absolute_clean_path(&workspace) {
             return Err(failure(
                 "invalid_configuration",
-                "runtime package, Codex home, and workspace must be absolute paths without parent traversal",
+                "runtime package and workspace must be absolute paths without parent traversal",
                 false,
             ));
         }
@@ -298,7 +296,6 @@ impl ProviderConfig {
         }
         Ok(Self {
             runtime_package,
-            codex_home,
             model,
             workspace,
         })
@@ -443,6 +440,9 @@ fn encode_failure_response(error: &ProviderFailure, request_id: String) -> Vec<u
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if let Some(exit_code) = runtime_verification_helper_exit_code() {
+        std::process::exit(exit_code);
+    }
     let (raw, request_id) = read_request();
     let parsed = raw.and_then(validate_request);
     let result = match parsed {
@@ -452,20 +452,81 @@ async fn main() {
         },
         Err(error) => Err(error),
     };
-    let response = match result {
-        Ok(Response::Model(response)) => serde_json::to_vec(&response),
-        Ok(Response::Image(response)) => serde_json::to_vec(&response),
-        Err(error) => Ok(encode_failure_response(&error, request_id)),
+    let bytes = match result {
+        Ok(response) => match encode_success_response(response) {
+            Ok(bytes) => bytes,
+            Err(error) => encode_failure_response(&error, request_id),
+        },
+        Err(error) => encode_failure_response(&error, request_id),
     };
-    match response {
-        Ok(bytes) => {
-            let mut stdout = io::BufWriter::new(io::stdout().lock());
-            let _ = stdout.write_all(&bytes);
-            let _ = stdout.write_all(b"\n");
-            let _ = stdout.flush();
-        }
-        Err(_) => std::process::exit(2),
+    let mut stdout = io::BufWriter::new(io::stdout().lock());
+    if write_response(&mut stdout, &bytes).is_err() {
+        std::process::exit(1);
     }
+}
+
+fn encode_success_response(response: Response) -> ProviderResult<Vec<u8>> {
+    let (bytes, maximum) = match response {
+        Response::Model(response) => (
+            serde_json::to_vec(&response).map_err(|error| {
+                failure(
+                    "provider_failed",
+                    &format!("model response could not be encoded: {error}"),
+                    false,
+                )
+            })?,
+            CodexConfig::MAX_FRAME_BYTES,
+        ),
+        Response::Image(response) => (
+            serde_json::to_vec(&response).map_err(|error| {
+                failure(
+                    "provider_failed",
+                    &format!("image response could not be encoded: {error}"),
+                    false,
+                )
+            })?,
+            MAX_IMAGE_FRAME_BYTES,
+        ),
+    };
+    if bytes.len() > maximum {
+        return Err(failure(
+            "resource_limit",
+            "provider response exceeds its bounded output frame",
+            false,
+        ));
+    }
+    Ok(bytes)
+}
+
+fn runtime_verification_helper_exit_code() -> Option<i32> {
+    let mut arguments = env::args_os();
+    let _program = arguments.next();
+    if arguments.next().as_deref() != Some(OsStr::new("--vergerail-runtime-verify")) {
+        return None;
+    }
+    let Some(root) = arguments.next() else {
+        eprintln!("runtime verification helper requires a package root");
+        return Some(64);
+    };
+    if arguments.next().is_some() {
+        eprintln!("runtime verification helper received unexpected arguments");
+        return Some(64);
+    }
+    let result =
+        RuntimePackage::pinned(PathBuf::from(root)).and_then(|package| package.verify_filesystem());
+    match result {
+        Ok(()) => Some(0),
+        Err(error) => {
+            eprintln!("runtime verification helper failed: {error}");
+            Some(1)
+        }
+    }
+}
+
+fn write_response<W: Write>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
+    writer.write_all(bytes)?;
+    writer.write_all(b"\n")?;
+    writer.flush()
 }
 
 fn reflected_request_id_from_bytes(bytes: &[u8]) -> String {
@@ -616,10 +677,12 @@ fn validate_request(request: ProviderRequest) -> ProviderResult<ProviderRequest>
                 false,
             ));
         }
-        if !tool.input_schema.is_object() {
+        if tool.input_schema.get("type") != Some(&Value::String("object".to_owned()))
+            || tool.input_schema.get("nullable") == Some(&Value::Bool(true))
+        {
             return Err(failure(
                 "invalid_request",
-                "tool inputSchema must be a JSON object",
+                "tool inputSchema root must explicitly declare type=object",
                 false,
             ));
         }
@@ -640,7 +703,7 @@ fn validate_request(request: ProviderRequest) -> ProviderResult<ProviderRequest>
                 false,
             )
         })?;
-        if schema_bytes.len() > 64 * 1024 {
+        if schema_bytes.len() > CodexConfig::MIN_FRAME_BYTES {
             return Err(failure(
                 "resource_limit",
                 "model output schema exceeds the 64 KiB native bound",
@@ -774,6 +837,15 @@ async fn async_run_request(
     request: ProviderRequest,
     config: ProviderConfig,
 ) -> ProviderResult<Response> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(request.timeout_ms))
+        .ok_or_else(|| {
+            failure(
+                "invalid_request",
+                "timeoutMs overflowed the monotonic clock",
+                false,
+            )
+        })?;
     let runtime = RuntimePackage::pinned(&config.runtime_package).map_err(|error| {
         failure(
             "runtime_verification",
@@ -785,18 +857,70 @@ async fn async_run_request(
     let codex = connect(
         runtime,
         enable_images,
-        &config.codex_home,
         Duration::from_millis(request.timeout_ms),
+        deadline,
     )
     .await?;
-    let operation = match request.operation {
-        ProviderOperation::ModelTurn => run_model_turn(&codex, &config, &request).await,
-        ProviderOperation::ImageGenerate => run_image_generation(&codex, &request).await,
+    let operation = match remaining_provider_timeout(deadline) {
+        Err(error) => Err(error),
+        Ok(operation_timeout) => match request.operation {
+            ProviderOperation::ModelTurn => match timeout(
+                operation_timeout,
+                run_model_turn(&codex, &config, &request, deadline),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(failure(
+                    "timeout",
+                    "provider operation exceeded timeoutMs",
+                    false,
+                )),
+            },
+            ProviderOperation::ImageGenerate => {
+                match timeout(operation_timeout, run_image_generation(&codex, &request)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(failure(
+                        "resolution_required",
+                        "billed image operation exceeded timeoutMs; resolve the outcome before retrying",
+                        false,
+                    )),
+                }
+            }
+        },
     };
-    let shutdown = codex
-        .shutdown()
-        .await
-        .map_err(|error| classify_vergerail_error(&error.to_string(), error.kind()));
+    let shutdown = match remaining_provider_timeout(deadline) {
+        Ok(shutdown_timeout) => match timeout(shutdown_timeout, codex.shutdown()).await {
+            Ok(result) => {
+                result.map_err(|error| classify_vergerail_error(&error.to_string(), error.kind()))
+            }
+            Err(_) => Err(failure(
+                "timeout",
+                "provider shutdown exceeded timeoutMs",
+                false,
+            )),
+        },
+        Err(error) => match bounded_teardown(codex.shutdown()).await {
+            Ok(Ok(())) => Err(error),
+            Ok(Err(shutdown_error)) => Err(failure(
+                "timeout",
+                &format!(
+                    "provider deadline expired; bounded teardown failed: {}",
+                    classify_vergerail_error(&shutdown_error.to_string(), shutdown_error.kind())
+                        .message
+                ),
+                false,
+            )),
+            Err(()) => Err(failure(
+                "timeout",
+                &format!(
+                    "provider deadline expired; bounded teardown exceeded {} ms",
+                    PROVIDER_TEARDOWN_BUDGET.as_millis()
+                ),
+                false,
+            )),
+        },
+    };
     match (operation, shutdown) {
         (Ok(response), Ok(())) => Ok(response),
         (Err(error), Ok(())) => Err(error),
@@ -815,19 +939,19 @@ async fn async_run_request(
 async fn connect(
     runtime: RuntimePackage,
     enable_images: bool,
-    codex_home: &std::path::Path,
     request_timeout: Duration,
+    deadline: Instant,
 ) -> ProviderResult<Codex> {
     Codex::connect(
         CodexConfig::new(runtime)
-            .with_codex_home(codex_home)
-            .map_err(|error| failure("invalid_configuration", &error.to_string(), false))?
             .with_image_generation(enable_images)
             .with_request_timeout(request_timeout)
+            .with_shutdown_timeout(PROVIDER_TEARDOWN_BUDGET)
+            .with_absolute_deadline(deadline)
             .with_max_frame_bytes(if enable_images {
                 MAX_IMAGE_FRAME_BYTES
             } else {
-                MAX_FRAME_BYTES
+                CodexConfig::MAX_FRAME_BYTES
             })
             .map_err(|error| failure("invalid_configuration", &error.to_string(), false))?,
     )
@@ -839,13 +963,14 @@ async fn run_model_turn(
     codex: &Codex,
     config: &ProviderConfig,
     request: &ProviderRequest,
+    deadline: Instant,
 ) -> ProviderResult<Response> {
     let rendered = render_model_prompt(request)?;
     let output_schema = model_output_schema(request)?;
     let mut options = SessionOptions::read_only(&config.workspace)
         .with_model(&config.model)
         .with_reasoning(map_reasoning(request.reasoning))
-        .with_turn_timeout(Duration::from_millis(request.timeout_ms))
+        .with_turn_timeout(remaining_provider_timeout(deadline)?)
         .with_maximum_output_bytes(model_session_bytes(request.maximum_response_bytes))
         .with_output_schema(output_schema)
         .text_only();
@@ -960,6 +1085,32 @@ async fn run_model_turn(
     }
 }
 
+fn remaining_provider_timeout(deadline: Instant) -> ProviderResult<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(failure("timeout", "provider deadline expired", false))
+    } else {
+        Ok(remaining)
+    }
+}
+
+async fn bounded_teardown<F, T>(future: F) -> std::result::Result<T, ()>
+where
+    F: Future<Output = T>,
+{
+    bounded_teardown_with_budget(PROVIDER_TEARDOWN_BUDGET, future).await
+}
+
+async fn bounded_teardown_with_budget<F, T>(
+    budget: Duration,
+    future: F,
+) -> std::result::Result<T, ()>
+where
+    F: Future<Output = T>,
+{
+    timeout(budget, future).await.map_err(|_| ())
+}
+
 fn model_session_bytes(maximum_text_bytes: usize) -> usize {
     JSON_STRING_MAX_EXPANSION
         .saturating_mul(
@@ -985,7 +1136,6 @@ async fn run_image_generation(
         .ok_or_else(|| failure("invalid_request", "image_generate requires prompt", false))?;
     let options = request.image_options.as_ref();
     let direct = DirectImageRequest {
-        model: "gpt-image-1".to_owned(),
         prompt: prompt.to_owned(),
         background: options
             .and_then(|options| options.background)
@@ -1004,16 +1154,15 @@ async fn run_image_generation(
         .generate_image(direct)
         .await
         .map_err(|error| classify_vergerail_error(&error.to_string(), error.kind()))?;
-    let mut provider_image =
-        provider_image_from_base64(generated.base64(), request.maximum_response_bytes)?;
-    if (provider_image.width, provider_image.height) != (generated.width(), generated.height()) {
-        return Err(failure(
-            "invalid_provider_output",
-            "direct image response dimensions did not match the decoded PNG",
-            false,
-        ));
-    }
-    provider_image.transparent_background = generated.transparent_background();
+    let provider_image = provider_image_from_response(
+        generated.media_type(),
+        generated.base64(),
+        generated.byte_length(),
+        generated.width(),
+        generated.height(),
+        generated.transparent_background(),
+        request.maximum_response_bytes,
+    )?;
     Ok(Response::Image(ImageResponse {
         schema_version: PROTOCOL_VERSION,
         request_id: request.request_id.clone(),
@@ -1048,39 +1197,36 @@ fn direct_quality(value: ImageQualityOption) -> ImageQuality {
     }
 }
 
-fn provider_image_from_base64(
+fn provider_image_from_response(
+    media_type: &str,
     result_base64: &str,
+    byte_length: usize,
+    width: u32,
+    height: u32,
+    transparent_background: Option<bool>,
     maximum_response_bytes: usize,
 ) -> ProviderResult<ProviderImage> {
-    if result_base64.len() > MAX_IMAGE_BASE64_BYTES {
+    if result_base64.is_empty() || result_base64.len() > MAX_IMAGE_BASE64_BYTES {
         return Err(failure(
             "resource_limit",
             "encoded image exceeds the bounded output frame limit",
             false,
         ));
     }
-    let bytes = BASE64_STANDARD.decode(result_base64).map_err(|error| {
-        failure(
-            "invalid_provider_output",
-            &format!("image result was not valid base64: {error}"),
-            false,
-        )
-    })?;
-    if bytes.len() > MAX_IMAGE_BYTES || bytes.len() > maximum_response_bytes {
+    if byte_length == 0 || byte_length > MAX_IMAGE_BYTES || byte_length > maximum_response_bytes {
         return Err(failure(
             "resource_limit",
             "decoded image exceeds the bounded output limit",
             false,
         ));
     }
-    let (width, height) = validate_png(&bytes)?;
     Ok(ProviderImage {
-        media_type: "image/png",
-        base64: BASE64_STANDARD.encode(&bytes),
-        byte_length: bytes.len(),
+        media_type: media_type.to_owned(),
+        base64: result_base64.to_owned(),
+        byte_length,
         width,
         height,
-        transparent_background: None,
+        transparent_background,
     })
 }
 
@@ -1183,6 +1329,7 @@ fn model_output_schema(request: &ProviderRequest) -> ProviderResult<Value> {
 fn close_native_object_schemas(schema: &mut Value) -> ProviderResult<()> {
     match schema {
         Value::Object(object) => {
+            normalize_native_const_type(object)?;
             let object_schema = match object.get("type") {
                 Some(Value::String(kind)) => kind == "object",
                 Some(Value::Array(types)) => {
@@ -1252,7 +1399,7 @@ fn close_native_object_schemas(schema: &mut Value) -> ProviderResult<()> {
                         if !existing_required.iter().any(|required| required == name)
                             && let Some(property) = properties.get_mut(name)
                         {
-                            make_native_property_nullable(property);
+                            make_native_property_nullable(property)?;
                         }
                     }
                 }
@@ -1275,15 +1422,200 @@ fn close_native_object_schemas(schema: &mut Value) -> ProviderResult<()> {
     Ok(())
 }
 
-fn make_native_property_nullable(schema: &mut Value) {
+fn native_json_type(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::Null => Some("null"),
+        Value::Bool(_) => Some("boolean"),
+        Value::Number(number) if number_is_integral(number) => Some("integer"),
+        Value::Number(_) => Some("number"),
+        Value::String(_) => Some("string"),
+        Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
+fn number_is_integral(number: &serde_json::Number) -> bool {
+    number.is_i64()
+        || number.is_u64()
+        || number
+            .as_f64()
+            .is_some_and(|value| value.is_finite() && value.fract() == 0.0)
+}
+
+fn normalize_native_const_type(object: &mut serde_json::Map<String, Value>) -> ProviderResult<()> {
+    let Some(constant) = object.get("const").cloned() else {
+        return Ok(());
+    };
+    let Some(kind) = native_json_type(&constant) else {
+        return Err(failure(
+            "invalid_request",
+            "native strict schemas do not support array or object const values",
+            false,
+        ));
+    };
+    validate_const_enum_membership(object, &constant)?;
+    if let Some(type_value) = object.get("type")
+        && !native_type_includes(type_value, kind)
+    {
+        return Err(failure(
+            "invalid_request",
+            "native strict schema const value does not match its declared type",
+            false,
+        ));
+    }
+    object
+        .entry("type".to_owned())
+        .or_insert_with(|| Value::String(kind.to_owned()));
+    Ok(())
+}
+
+fn validate_const_enum_membership(
+    object: &serde_json::Map<String, Value>,
+    constant: &Value,
+) -> ProviderResult<()> {
+    let Some(enum_value) = object.get("enum") else {
+        return Ok(());
+    };
+    let values = enum_value.as_array().ok_or_else(|| {
+        failure(
+            "invalid_request",
+            "native strict schema enum must be an array when const is present",
+            false,
+        )
+    })?;
+    if values
+        .iter()
+        .any(|value| primitive_schema_values_equal(value, constant))
+    {
+        Ok(())
+    } else {
+        Err(failure(
+            "invalid_request",
+            "native strict schema const value is excluded by enum",
+            false,
+        ))
+    }
+}
+
+fn primitive_schema_values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Null, Value::Null)
+        | (Value::Bool(_), Value::Bool(_))
+        | (Value::String(_), Value::String(_)) => left == right,
+        (Value::Number(left), Value::Number(right)) => numeric_schema_values_equal(left, right),
+        _ => false,
+    }
+}
+
+fn numeric_schema_values_equal(left: &serde_json::Number, right: &serde_json::Number) -> bool {
+    canonical_decimal(left) == canonical_decimal(right)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CanonicalDecimal {
+    negative: bool,
+    digits: String,
+    scale: i32,
+}
+
+fn canonical_decimal(number: &serde_json::Number) -> Option<CanonicalDecimal> {
+    let text = number.to_string();
+    let exponent_start = text.find(['e', 'E']);
+    let (mantissa, exponent) = match exponent_start {
+        Some(index) => (&text[..index], text[index + 1..].parse::<i32>().ok()?),
+        None => (text.as_str(), 0),
+    };
+    let negative = mantissa.starts_with('-');
+    let mantissa = mantissa
+        .strip_prefix('-')
+        .or_else(|| mantissa.strip_prefix('+'))
+        .unwrap_or(mantissa);
+    let decimal_start = mantissa.find('.');
+    let fractional_digits = match decimal_start {
+        Some(index) => i32::try_from(mantissa.len() - index - 1).ok()?,
+        None => 0,
+    };
+    let digits = mantissa.replace('.', "");
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let first_nonzero = digits.bytes().position(|byte| byte != b'0');
+    let Some(first_nonzero) = first_nonzero else {
+        return Some(CanonicalDecimal {
+            negative: false,
+            digits: "0".to_owned(),
+            scale: 0,
+        });
+    };
+    let mut digits = digits[first_nonzero..].to_owned();
+    let mut scale = exponent.checked_sub(fractional_digits)?;
+    while digits.ends_with('0') {
+        digits.pop();
+        scale = scale.checked_add(1)?;
+    }
+    Some(CanonicalDecimal {
+        negative,
+        digits,
+        scale,
+    })
+}
+
+fn native_type_includes(type_value: &Value, expected: &str) -> bool {
+    match type_value {
+        Value::String(kind) => native_type_pair_is_compatible(kind, expected),
+        Value::Array(types) => types
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|kind| native_type_pair_is_compatible(kind, expected)),
+        _ => false,
+    }
+}
+
+fn native_type_pair_is_compatible(declared: &str, actual: &str) -> bool {
+    declared == actual || (declared == "number" && actual == "integer")
+}
+
+fn make_native_property_nullable(schema: &mut Value) -> ProviderResult<()> {
     if let Value::Object(object) = schema {
+        if let Some(constant) = object.remove("const") {
+            let Some(kind) = native_json_type(&constant) else {
+                return Err(failure(
+                    "invalid_request",
+                    "native strict schemas do not support array or object const values",
+                    false,
+                ));
+            };
+            validate_const_enum_membership(object, &constant)?;
+            if let Some(type_value) = object.get("type")
+                && !native_type_includes(type_value, kind)
+            {
+                return Err(failure(
+                    "invalid_request",
+                    "native strict schema const value does not match its declared type",
+                    false,
+                ));
+            }
+            object
+                .entry("type".to_owned())
+                .or_insert_with(|| Value::String(kind.to_owned()));
+            object.remove("enum");
+            let mut enum_values = vec![constant];
+            if kind != "null" {
+                enum_values.push(Value::Null);
+            }
+            object.insert("enum".to_owned(), Value::Array(enum_values));
+        }
         if let Some(type_value) = object.get("type")
             && (type_value.as_str() == Some("null")
                 || type_value
                     .as_array()
                     .is_some_and(|types| types.iter().any(|value| value.as_str() == Some("null"))))
         {
-            return;
+            if let Some(enum_values) = object.get_mut("enum").and_then(Value::as_array_mut)
+                && !enum_values.iter().any(Value::is_null)
+            {
+                enum_values.push(Value::Null);
+            }
+            return Ok(());
         }
         if object
             .get("anyOf")
@@ -1297,7 +1629,7 @@ fn make_native_property_nullable(schema: &mut Value) {
                 })
             })
         {
-            return;
+            return Ok(());
         }
         if let Some(type_value) = object.get_mut("type") {
             match type_value {
@@ -1305,20 +1637,27 @@ fn make_native_property_nullable(schema: &mut Value) {
                     let kind = std::mem::take(kind);
                     *type_value =
                         Value::Array(vec![Value::String(kind), Value::String("null".to_owned())]);
-                    return;
                 }
                 Value::Array(types) => {
-                    types.push(Value::String("null".to_owned()));
-                    return;
+                    if !types.iter().any(|value| value.as_str() == Some("null")) {
+                        types.push(Value::String("null".to_owned()));
+                    }
                 }
                 Value::Null | Value::Bool(_) | Value::Number(_) | Value::Object(_) => {}
             }
+            if let Some(enum_values) = object.get_mut("enum").and_then(Value::as_array_mut)
+                && !enum_values.iter().any(Value::is_null)
+            {
+                enum_values.push(Value::Null);
+            }
+            return Ok(());
         }
     }
     let original = schema.clone();
     *schema = serde_json::json!({
         "anyOf": [original, {"type": "null"}]
     });
+    Ok(())
 }
 
 fn flatten_native_tool_calls(
@@ -1426,47 +1765,6 @@ fn map_reasoning(reasoning: ProviderReasoning) -> ReasoningEffort {
     }
 }
 
-fn validate_png(bytes: &[u8]) -> ProviderResult<(u32, u32)> {
-    if bytes.len() < 33 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") || &bytes[12..16] != b"IHDR" {
-        return Err(failure(
-            "invalid_provider_output",
-            "image generation must return a PNG raster",
-            false,
-        ));
-    }
-    let width_bytes: [u8; 4] = bytes[16..20].try_into().map_err(|_| {
-        failure(
-            "invalid_provider_output",
-            "PNG width header is invalid",
-            false,
-        )
-    })?;
-    let height_bytes: [u8; 4] = bytes[20..24].try_into().map_err(|_| {
-        failure(
-            "invalid_provider_output",
-            "PNG height header is invalid",
-            false,
-        )
-    })?;
-    let width = u32::from_be_bytes(width_bytes);
-    let height = u32::from_be_bytes(height_bytes);
-    if width == 0 || height == 0 || width > 8_192 || height > 8_192 {
-        return Err(failure(
-            "resource_limit",
-            "PNG dimensions exceed the bounded raster limit",
-            false,
-        ));
-    }
-    if u64::from(width) * u64::from(height) > 8_192 * 8_192 {
-        return Err(failure(
-            "resource_limit",
-            "PNG decoded pixel count exceeds the bounded raster limit",
-            false,
-        ));
-    }
-    Ok((width, height))
-}
-
 fn classify_vergerail_error(message: &str, kind: vergerail::ErrorKind) -> ProviderFailure {
     let code = match kind {
         vergerail::ErrorKind::Timeout => "timeout",
@@ -1474,6 +1772,7 @@ fn classify_vergerail_error(message: &str, kind: vergerail::ErrorKind) -> Provid
         | vergerail::ErrorKind::Disconnected
         | vergerail::ErrorKind::ConsumerLagged => "resolution_required",
         vergerail::ErrorKind::Authentication => "authentication_required",
+        vergerail::ErrorKind::Cancelled => "cancelled",
         vergerail::ErrorKind::RuntimeVerification => "runtime_verification",
         vergerail::ErrorKind::InvalidInput => "invalid_request",
         _ => "provider_failed",
@@ -1485,6 +1784,19 @@ fn classify_vergerail_error(message: &str, kind: vergerail::ErrorKind) -> Provid
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io;
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("closed stdout"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("closed stdout"))
+        }
+    }
 
     fn request(operation: ProviderOperation) -> ProviderRequest {
         ProviderRequest {
@@ -1531,6 +1843,24 @@ mod tests {
             validate_request(oversized).expect_err("bound").code,
             "invalid_request"
         );
+    }
+
+    #[test]
+    fn stdout_write_failure_is_reported_to_the_process_boundary() {
+        assert!(write_response(&mut FailingWriter, b"{}\n").is_err());
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_teardown_is_bounded_by_its_separate_budget() {
+        let started = Instant::now();
+        let result = bounded_teardown_with_budget(
+            Duration::from_millis(10),
+            tokio::time::sleep(Duration::from_millis(50)),
+        )
+        .await;
+        assert!(result.is_err(), "teardown must stop at its fixed budget");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(PROVIDER_TEARDOWN_BUDGET, Duration::from_secs(2));
     }
 
     #[test]
@@ -1637,6 +1967,333 @@ mod tests {
                 .contains("oneOf")
         );
         validate_request(value).expect("strict bounded tool schema");
+    }
+
+    #[test]
+    fn native_output_schema_infers_primitive_types_for_const_properties() {
+        let mut value = request(ProviderOperation::ModelTurn);
+        value.tools.push(ProviderTool {
+            name: "edit_asset".to_owned(),
+            description: "Edit one image".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["operation", "mediaType"],
+                "properties": {
+                    "operation": {"const": "remove_background"},
+                    "mediaType": {"const": "image/png"}
+                }
+            }),
+            strict: true,
+        });
+        let schema = model_output_schema(&value).expect("native schema");
+        for property in ["operation", "mediaType"] {
+            assert_eq!(
+                schema.pointer(&format!(
+                    "/properties/toolCalls/properties/edit_asset/items/properties/arguments/properties/{property}/type"
+                )),
+                Some(&json!("string"))
+            );
+        }
+        assert_eq!(
+            schema.pointer(
+                "/properties/toolCalls/properties/edit_asset/items/properties/arguments/properties/operation/const"
+            ),
+            Some(&json!("remove_background"))
+        );
+        assert_eq!(
+            schema.pointer(
+                "/properties/toolCalls/properties/edit_asset/items/properties/arguments/properties/operation/enum"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn native_output_schema_normalizes_optional_primitive_consts_to_nullable_enums() {
+        for (constant, expected_type) in [
+            (json!("remove_background"), json!("string")),
+            (json!(7), json!("integer")),
+            (json!(true), json!("boolean")),
+        ] {
+            let mut value = request(ProviderOperation::ModelTurn);
+            value.tools.push(ProviderTool {
+                name: "optional_const".to_owned(),
+                description: "Optional primitive const".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {"value": {"const": constant}}
+                }),
+                strict: true,
+            });
+            let schema = model_output_schema(&value).expect("native schema");
+            let base = "/properties/toolCalls/properties/optional_const/items/properties/arguments/properties/value";
+            assert_eq!(
+                schema.pointer(&format!("{base}/type")),
+                Some(&json!([expected_type, "null"]))
+            );
+            assert_eq!(
+                schema.pointer(&format!("{base}/enum")),
+                Some(&json!([constant, null]))
+            );
+            assert_eq!(schema.pointer(&format!("{base}/const")), None);
+        }
+    }
+
+    #[test]
+    fn native_output_schema_respects_json_number_integer_compatibility() {
+        let mut required_number = request(ProviderOperation::ModelTurn);
+        required_number.tools.push(ProviderTool {
+            name: "number_const".to_owned(),
+            description: "Number const".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["value"],
+                "properties": {"value": {"type": "number", "const": 7}}
+            }),
+            strict: true,
+        });
+        let schema = model_output_schema(&required_number).expect("number const schema");
+        let base = "/properties/toolCalls/properties/number_const/items/properties/arguments/properties/value";
+        assert_eq!(
+            schema.pointer(&format!("{base}/type")),
+            Some(&json!("number"))
+        );
+        assert_eq!(schema.pointer(&format!("{base}/const")), Some(&json!(7)));
+
+        let mut optional_number = required_number.clone();
+        optional_number.tools[0].input_schema["required"] = json!([]);
+        let schema = model_output_schema(&optional_number).expect("optional number const schema");
+        assert_eq!(
+            schema.pointer(&format!("{base}/type")),
+            Some(&json!(["number", "null"]))
+        );
+        assert_eq!(
+            schema.pointer(&format!("{base}/enum")),
+            Some(&json!([7, null]))
+        );
+        assert_eq!(schema.pointer(&format!("{base}/const")), None);
+
+        for constant in [json!(7.0), json!(7e0)] {
+            let mut integral = request(ProviderOperation::ModelTurn);
+            integral.tools.push(ProviderTool {
+                name: "integral_const".to_owned(),
+                description: "Integral number const".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["value"],
+                    "properties": {"value": {"type": "integer", "const": constant}}
+                }),
+                strict: true,
+            });
+            let schema = model_output_schema(&integral).expect("integral number const schema");
+            assert_eq!(
+                schema.pointer(
+                    "/properties/toolCalls/properties/integral_const/items/properties/arguments/properties/value/type"
+                ),
+                Some(&json!("integer"))
+            );
+        }
+
+        let mut fractional = request(ProviderOperation::ModelTurn);
+        fractional.tools.push(ProviderTool {
+            name: "fractional_const".to_owned(),
+            description: "Fractional number const".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["value"],
+                "properties": {"value": {"type": "integer", "const": 7.5}}
+            }),
+            strict: true,
+        });
+        assert_eq!(
+            model_output_schema(&fractional)
+                .expect_err("fractional const cannot satisfy integer")
+                .code,
+            "invalid_request"
+        );
+
+        let mut fractional_number = request(ProviderOperation::ModelTurn);
+        fractional_number.tools.push(ProviderTool {
+            name: "fractional_number".to_owned(),
+            description: "Fractional number const".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["value"],
+                "properties": {"value": {"type": "number", "const": 7.5}}
+            }),
+            strict: true,
+        });
+        let schema = model_output_schema(&fractional_number).expect("fractional number schema");
+        assert_eq!(
+            schema.pointer(
+                "/properties/toolCalls/properties/fractional_number/items/properties/arguments/properties/value/type"
+            ),
+            Some(&json!("number"))
+        );
+
+        let mut number_union = request(ProviderOperation::ModelTurn);
+        number_union.tools.push(ProviderTool {
+            name: "number_union".to_owned(),
+            description: "Number/integer const".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["value"],
+                "properties": {"value": {"type": ["number", "null"], "const": 7}}
+            }),
+            strict: true,
+        });
+        model_output_schema(&number_union).expect("number union accepts integer const");
+
+        let mut compatible_enum = request(ProviderOperation::ModelTurn);
+        compatible_enum.tools.push(ProviderTool {
+            name: "compatible_enum".to_owned(),
+            description: "Numerically compatible const enum".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["value"],
+                "properties": {"value": {"type": "number", "const": 7, "enum": [7.0]}}
+            }),
+            strict: true,
+        });
+        let schema = model_output_schema(&compatible_enum).expect("7 and 7.0 are equal");
+        let base = "/properties/toolCalls/properties/compatible_enum/items/properties/arguments/properties/value";
+        assert_eq!(
+            schema.pointer(&format!("{base}/type")),
+            Some(&json!("number"))
+        );
+        assert_eq!(schema.pointer(&format!("{base}/const")), Some(&json!(7)));
+        assert_eq!(schema.pointer(&format!("{base}/enum")), Some(&json!([7.0])));
+
+        let mut optional_compatible_enum = compatible_enum.clone();
+        optional_compatible_enum.tools[0].input_schema["required"] = json!([]);
+        optional_compatible_enum.tools[0].input_schema["properties"]["value"]["enum"] =
+            json!([7e0, 8]);
+        let schema = model_output_schema(&optional_compatible_enum)
+            .expect("optional 7 and exponent 7 are equal");
+        assert_eq!(
+            schema.pointer(&format!("{base}/type")),
+            Some(&json!(["number", "null"]))
+        );
+        assert_eq!(
+            schema.pointer(&format!("{base}/enum")),
+            Some(&json!([7, null]))
+        );
+        assert_eq!(schema.pointer(&format!("{base}/const")), None);
+
+        let mut incompatible_enum = request(ProviderOperation::ModelTurn);
+        incompatible_enum.tools.push(ProviderTool {
+            name: "incompatible_enum".to_owned(),
+            description: "Numerically incompatible const enum".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["value"],
+                "properties": {"value": {"type": "number", "const": 7, "enum": [7.5]}}
+            }),
+            strict: true,
+        });
+        assert_eq!(
+            model_output_schema(&incompatible_enum)
+                .expect_err("7 and 7.5 are not equal")
+                .code,
+            "invalid_request"
+        );
+
+        let mut large_integer = request(ProviderOperation::ModelTurn);
+        large_integer.tools.push(ProviderTool {
+            name: "large_integer".to_owned(),
+            description: "Lossless integer equality".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["value"],
+                "properties": {
+                    "value": {
+                        "type": "number",
+                        "const": 9_007_199_254_740_993u64,
+                        "enum": [9_007_199_254_740_992.0]
+                    }
+                }
+            }),
+            strict: true,
+        });
+        assert_eq!(
+            model_output_schema(&large_integer)
+                .expect_err("lossy float must not equal a distinct large integer")
+                .code,
+            "invalid_request"
+        );
+
+        let mut negative_zero = request(ProviderOperation::ModelTurn);
+        negative_zero.tools.push(ProviderTool {
+            name: "negative_zero".to_owned(),
+            description: "Signed zero equality".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["value"],
+                "properties": {"value": {"type": "number", "const": 0, "enum": [-0.0]}}
+            }),
+            strict: true,
+        });
+        model_output_schema(&negative_zero).expect("-0 and 0 are equal");
+
+        let mut integer_union = request(ProviderOperation::ModelTurn);
+        integer_union.tools.push(ProviderTool {
+            name: "integer_union".to_owned(),
+            description: "Integer/number const".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["value"],
+                "properties": {"value": {"type": ["integer", "null"], "const": 7.5}}
+            }),
+            strict: true,
+        });
+        assert_eq!(
+            model_output_schema(&integer_union)
+                .expect_err("integer union rejects fractional const")
+                .code,
+            "invalid_request"
+        );
+    }
+
+    #[test]
+    fn native_output_schema_rejects_unsupported_const_values_and_is_idempotent() {
+        let mut unsupported = request(ProviderOperation::ModelTurn);
+        unsupported.tools.push(ProviderTool {
+            name: "unsupported_const".to_owned(),
+            description: "Unsupported const".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {"value": {"const": {"nested": true}}}
+            }),
+            strict: true,
+        });
+        assert_eq!(
+            model_output_schema(&unsupported)
+                .expect_err("array/object const must be rejected")
+                .code,
+            "invalid_request"
+        );
+
+        let mut schema = json!({
+            "type": "object",
+            "properties": {"value": {"const": "x", "enum": ["x", "other"]}}
+        });
+        close_native_object_schemas(&mut schema).expect("first normalization");
+        let normalized = schema.clone();
+        close_native_object_schemas(&mut schema).expect("second normalization");
+        assert_eq!(schema, normalized);
     }
 
     #[test]
@@ -1771,6 +2428,51 @@ mod tests {
     }
 
     #[test]
+    fn tool_schema_root_must_be_a_non_nullable_object() {
+        for root in [json!({}), json!("object"), json!([]), json!(null)] {
+            let mut value = request(ProviderOperation::ModelTurn);
+            value.tools.push(ProviderTool {
+                name: "invalid_root".to_owned(),
+                description: "Invalid root".to_owned(),
+                input_schema: root,
+                strict: true,
+            });
+            assert_eq!(
+                validate_request(value)
+                    .expect_err("tool root must be explicitly object")
+                    .code,
+                "invalid_request"
+            );
+        }
+        let mut nullable = request(ProviderOperation::ModelTurn);
+        nullable.tools.push(ProviderTool {
+            name: "nullable_root".to_owned(),
+            description: "Nullable root".to_owned(),
+            input_schema: json!({"type": ["object", "null"]}),
+            strict: true,
+        });
+        assert_eq!(
+            validate_request(nullable)
+                .expect_err("nullable root must be rejected")
+                .code,
+            "invalid_request"
+        );
+        let mut nullable_flag = request(ProviderOperation::ModelTurn);
+        nullable_flag.tools.push(ProviderTool {
+            name: "nullable_flag".to_owned(),
+            description: "Nullable root flag".to_owned(),
+            input_schema: json!({"type": "object", "nullable": true}),
+            strict: true,
+        });
+        assert_eq!(
+            validate_request(nullable_flag)
+                .expect_err("nullable root flag must be rejected")
+                .code,
+            "invalid_request"
+        );
+    }
+
+    #[test]
     fn returned_tools_enforce_identity_object_and_aggregate_bounds() {
         let tools = vec![ProviderTool {
             name: "inspect_asset".to_owned(),
@@ -1893,51 +2595,55 @@ mod tests {
     }
 
     #[test]
-    fn png_header_and_decoded_pixel_bounds_are_enforced() {
-        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-        png.extend_from_slice(&13u32.to_be_bytes());
-        png.extend_from_slice(b"IHDR");
-        png.extend_from_slice(&1u32.to_be_bytes());
-        png.extend_from_slice(&1u32.to_be_bytes());
-        png.extend_from_slice(&[8, 6, 0, 0, 0]);
-        png.extend_from_slice(&0u32.to_be_bytes());
-        assert_eq!(validate_png(&png).unwrap(), (1, 1));
-        png[16..20].copy_from_slice(&9_000u32.to_be_bytes());
+    fn image_payload_forwards_validated_metadata_and_enforces_caps() {
+        let image = provider_image_from_response(
+            "image/png",
+            "already-validated-base64",
+            123,
+            2,
+            3,
+            Some(true),
+            123,
+        )
+        .expect("validated image metadata");
+        assert_eq!(image.media_type, "image/png");
+        assert_eq!(image.base64, "already-validated-base64");
+        assert_eq!(image.byte_length, 123);
+        assert_eq!((image.width, image.height), (2, 3));
+        assert_eq!(image.transparent_background, Some(true));
+
+        let oversized_encoded = "x".repeat(MAX_IMAGE_BASE64_BYTES + 1);
         assert_eq!(
-            validate_png(&png).expect_err("dimension bound").code,
+            provider_image_from_response(
+                "image/png",
+                &oversized_encoded,
+                1,
+                1,
+                1,
+                None,
+                MAX_IMAGE_BYTES,
+            )
+            .expect_err("encoded image cap")
+            .code,
             "resource_limit"
         );
-    }
-
-    #[test]
-    fn image_payload_requires_bounded_png_and_reports_exact_dimensions() {
         assert_eq!(
-            provider_image_from_base64("not-base64", MAX_IMAGE_BYTES)
-                .expect_err("base64 failure")
-                .code,
-            "invalid_provider_output"
+            provider_image_from_response(
+                "image/png",
+                "x",
+                MAX_IMAGE_BYTES + 1,
+                1,
+                1,
+                None,
+                MAX_IMAGE_BYTES,
+            )
+            .expect_err("decoded image cap")
+            .code,
+            "resource_limit"
         );
         assert_eq!(
-            provider_image_from_base64(&BASE64_STANDARD.encode(b"not-png"), MAX_IMAGE_BYTES)
-                .expect_err("PNG failure")
-                .code,
-            "invalid_provider_output"
-        );
-
-        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-        png.extend_from_slice(&13u32.to_be_bytes());
-        png.extend_from_slice(b"IHDR");
-        png.extend_from_slice(&2u32.to_be_bytes());
-        png.extend_from_slice(&3u32.to_be_bytes());
-        png.extend_from_slice(&[8, 6, 0, 0, 0]);
-        png.extend_from_slice(&0u32.to_be_bytes());
-        let encoded = BASE64_STANDARD.encode(&png);
-        let image = provider_image_from_base64(&encoded, png.len()).expect("bounded PNG");
-        assert_eq!((image.width, image.height), (2, 3));
-        assert_eq!(image.byte_length, png.len());
-        assert_eq!(
-            provider_image_from_base64(&encoded, png.len() - 1)
-                .expect_err("caller byte cap")
+            provider_image_from_response("image/png", "x", 2, 1, 1, None, 1)
+                .expect_err("caller image cap")
                 .code,
             "resource_limit"
         );
@@ -1953,7 +2659,7 @@ mod tests {
     #[test]
     fn image_frame_is_distinct_and_contains_the_bounded_encoded_raster() {
         assert_eq!(MAX_IMAGE_FRAME_BYTES, 16 * 1024 * 1024);
-        assert_ne!(MAX_IMAGE_FRAME_BYTES, MAX_FRAME_BYTES);
+        assert_ne!(MAX_IMAGE_FRAME_BYTES, CodexConfig::MAX_FRAME_BYTES);
     }
 
     #[test]

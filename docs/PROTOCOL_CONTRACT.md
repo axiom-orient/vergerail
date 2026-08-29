@@ -94,7 +94,8 @@ text-only는 sandbox의 대체물이 아닙니다. read-only sandbox와 함께 �
 
 - 한 줄에 UTF-8 JSON 값 하나
 - CRLF 허용, 빈 줄 거부
-- 기본 frame 제한 16MiB
+- 기본 frame 제한 16MiB; `CodexConfig::with_max_frame_bytes()`는 64KiB 이상
+  64MiB 이하만 허용
 - queue에 넣기 전에 encode와 크기 검증
 - `turn/start` 응답 전 알림도 run event capacity 안에서만 보관
 - assistant text와 item ID별 최신 image-generation payload는 frame별 크기와 별도로 합산 누적 byte 상한을 적용

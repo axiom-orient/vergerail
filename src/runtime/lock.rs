@@ -41,6 +41,7 @@ struct PinnedRuntimeArtifact {
     path: PathBuf,
     sha256: String,
     executable: bool,
+    max_bytes: u64,
 }
 
 impl PinnedRuntime {
@@ -53,11 +54,27 @@ impl PinnedRuntime {
                     format!("invalid embedded runtime metadata: {error}"),
                 )
             })?;
+        metadata.download.validate()?;
         let artifacts = metadata
             .artifacts
             .into_iter()
             .map(|artifact| {
-                RuntimeArtifact::new(artifact.path, artifact.sha256, artifact.executable)
+                if artifact.max_bytes == 0 || artifact.max_bytes == u64::MAX {
+                    return Err(Error::new(
+                        ErrorKind::RuntimeVerification,
+                        "runtime.metadata",
+                        format!(
+                            "artifact byte ceiling {} must be greater than zero and finite",
+                            artifact.max_bytes
+                        ),
+                    ));
+                }
+                RuntimeArtifact::with_max_bytes(
+                    artifact.path,
+                    artifact.sha256,
+                    artifact.executable,
+                    artifact.max_bytes,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         let lock = RuntimeLock::new(
@@ -69,7 +86,6 @@ impl PinnedRuntime {
             metadata.protocol_schema_canonical_sha256,
             artifacts,
         )?;
-        metadata.download.validate()?;
         Ok(Self {
             lock,
             download: metadata.download,
@@ -131,20 +147,40 @@ pub(crate) struct RuntimeArtifact {
     pub(crate) relative_path: PathBuf,
     pub(crate) sha256: String,
     pub(crate) executable: bool,
+    /// The strict byte ceiling observed from the audited pinned package.
+    pub(crate) max_bytes: u64,
 }
 
 impl RuntimeArtifact {
     /// Defines a required artifact and its lowercase SHA-256 digest.
+    #[cfg(test)]
     pub(crate) fn new(
         relative_path: impl Into<PathBuf>,
         sha256: impl Into<String>,
         executable: bool,
     ) -> Result<Self> {
+        Self::with_max_bytes(relative_path, sha256, executable, 128 * 1024 * 1024)
+    }
+
+    pub(crate) fn with_max_bytes(
+        relative_path: impl Into<PathBuf>,
+        sha256: impl Into<String>,
+        executable: bool,
+        max_bytes: u64,
+    ) -> Result<Self> {
         let artifact = Self {
             relative_path: relative_path.into(),
             sha256: sha256.into(),
             executable,
+            max_bytes,
         };
+        if artifact.max_bytes == 0 || artifact.max_bytes == u64::MAX {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "RuntimeArtifact::with_max_bytes",
+                "runtime artifact byte ceiling must be greater than zero and finite",
+            ));
+        }
         validate_relative_path(&artifact.relative_path)?;
         validate_sha256(&artifact.sha256)?;
         Ok(artifact)

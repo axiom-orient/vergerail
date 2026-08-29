@@ -8,7 +8,7 @@
 cargo build --locked --release --bin ifsc_text_provider
 ```
 
-필수 환경 변수:
+provider 자체의 필수 환경 변수:
 
 - `VERGERAIL_WORKSPACE`: 존재하는 읽기 전용 작업 디렉터리
 - `VERGERAIL_MODEL`: model catalog에서 정확히 일치하는 visible model
@@ -19,19 +19,25 @@ cargo build --locked --release --bin ifsc_text_provider
 - `VERGERAIL_IFSC_RUNTIME_DOWNLOAD`: `never`(기본값) 또는 `if-missing`
 - `VERGERAIL_IFSC_TURN_TIMEOUT_MS`: 5,000..=1,800,000, 기본값 600,000
 
-기본값은 실행 중 예기치 않은 runtime 다운로드를 하지 않습니다. 관리 cache가 없으면 검증된 package를 `VERGERAIL_CODEX_PACKAGE`로 주거나 설치를 명시적으로 `if-missing`으로 허용해야 합니다.
-
-provider는 app-server가 선택하는 기본 Codex home의 ChatGPT 앱 또는 `codex login`
-인증을 재사용합니다. signed-out이면 브라우저를 임의로 열지 않고
-`authentication-required`로 실패합니다.
+기본값은 실행 중 예기치 않은 runtime 다운로드를 하지 않습니다. 관리 cache가 없으면
+검증된 package를 `VERGERAIL_CODEX_PACKAGE`로 주거나 `if-missing`을 명시해야 합니다.
+provider는 Codex가 선택한 account를 사용하며 별도의 Vergerail account 경로나
+PerfectPixel 변수가 없다. upstream `CODEX_HOME`이 있으면 공식 app-server가
+그 값을 해석한다. 이미 인증되지 않은 account는
+브라우저를 임의로 열지 않고 `authentication-required`로 실패한다.
 
 ```bash
-export VERGERAIL_MODEL=gpt-5.6-luna
+export VERGERAIL_CODEX_PACKAGE="/absolute/path/to/official-codex-package" # optional
+export VERGERAIL_MODEL="gpt-5.6-luna"
 export VERGERAIL_WORKSPACE="$PWD"
-cargo run --locked --example live_e2e
+cargo run --locked --bin ifsc_text_provider < /absolute/path/to/request.json
 ```
 
-일회용 OAuth URL, 계정 선택, MFA는 사용자가 직접 처리합니다. URL이나 credential을 request, 로그, 저장소에 보관하지 않습니다.
+전체 Vergerail live E2E는 별도 `examples/live_e2e.rs` 경계다. 그 명령은
+`VERGERAIL_MODEL`, `VERGERAIL_WORKSPACE`, `VERGERAIL_PERFECTPIXEL_BIN`과 고정
+package를 요구하며, 정확한 명령은
+[검증](VERIFICATION.md)에만 둔다. 인증 URL, token, credential은 request·log·저장소에
+보관하지 않는다.
 
 ## stdin 요청
 

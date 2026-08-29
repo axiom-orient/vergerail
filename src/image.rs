@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::io::Read as _;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use std::path::{Path, PathBuf};
@@ -81,10 +82,11 @@ impl ImageSize {
 }
 
 /// One direct, non-idempotent image-generation request.
+///
+/// The model is pinned internally to the official 0.150.1 image contract;
+/// callers can select only the supported generation controls below.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirectImageRequest {
-    /// Images API model identifier.
-    pub model: String,
     /// Natural-language image prompt.
     pub prompt: String,
     /// Requested background treatment.
@@ -155,9 +157,13 @@ impl DirectImageResponse {
 pub(crate) const CHATGPT_IMAGE_GENERATION_ENDPOINT: &str =
     "https://chatgpt.com/backend-api/codex/images/generations";
 const CODEX_VERSION: &str = "0.150.1";
+// The official rust-v0.150.1 image extension pins this direct Images API model.
+// It is intentionally not part of the caller-facing request contract.
+const IMAGE_MODEL: &str = "gpt-image-2";
 const ORIGINATOR: &str = "codex_cli_rs";
 const MAX_IMAGE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IMAGE_JSON_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PNG_RAW_BYTES: usize = 14 * 1024 * 1024;
 const MAX_JWT_BYTES: usize = 256 * 1024;
 const MAX_ACCOUNT_ID_BYTES: usize = 256;
 static IMAGE_TURN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -292,15 +298,161 @@ pub(crate) enum ImageEndpointError {
     Failed(crate::error::Error),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImageOperationPhase {
+    Pending,
+    Dispatched,
+    CancelledBeforeDispatch,
+    CancelledAfterDispatch,
+    Finished,
+}
+
+/// Shared ownership state for one billed, non-idempotent image operation.
+/// The worker owns only this state and its result channel; it never mutates
+/// `ClientInner` directly.
+#[derive(Debug)]
+pub(crate) struct ImageOperationState {
+    phase: Mutex<ImageOperationPhase>,
+}
+
+impl ImageOperationState {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            phase: Mutex::new(ImageOperationPhase::Pending),
+        })
+    }
+
+    fn begin_dispatch(&self) -> Result<(), crate::error::Error> {
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *phase {
+            ImageOperationPhase::Pending => {
+                *phase = ImageOperationPhase::Dispatched;
+                Ok(())
+            }
+            ImageOperationPhase::CancelledBeforeDispatch
+            | ImageOperationPhase::CancelledAfterDispatch => Err(crate::error::Error::new(
+                crate::error::ErrorKind::Cancelled,
+                "image.generate",
+                "cancelled image operation cannot be dispatched again",
+            )),
+            ImageOperationPhase::Dispatched | ImageOperationPhase::Finished => {
+                Err(crate::error::Error::new(
+                    crate::error::ErrorKind::Protocol,
+                    "image.generate",
+                    "image operation was dispatched more than once",
+                ))
+            }
+        }
+    }
+
+    fn reset_after_unauthorized(&self) -> bool {
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*phase, ImageOperationPhase::Dispatched) {
+            *phase = ImageOperationPhase::Pending;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish(&self) {
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*phase, ImageOperationPhase::Dispatched) {
+            *phase = ImageOperationPhase::Finished;
+        }
+    }
+
+    fn is_dispatched(&self) -> bool {
+        matches!(
+            *self
+                .phase
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ImageOperationPhase::Dispatched
+                | ImageOperationPhase::CancelledAfterDispatch
+                | ImageOperationPhase::Finished
+        )
+    }
+
+    /// Marks the operation abandoned. Returns whether a request may already
+    /// have reached the billed endpoint and therefore requires resolution.
+    pub(crate) fn cancel(&self) -> bool {
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *phase {
+            ImageOperationPhase::Pending => {
+                *phase = ImageOperationPhase::CancelledBeforeDispatch;
+                false
+            }
+            ImageOperationPhase::Dispatched | ImageOperationPhase::Finished => {
+                *phase = ImageOperationPhase::CancelledAfterDispatch;
+                true
+            }
+            ImageOperationPhase::CancelledBeforeDispatch => false,
+            ImageOperationPhase::CancelledAfterDispatch => true,
+        }
+    }
+
+    pub(crate) fn cancellation_error(&self, turn_id: &str) -> crate::error::Error {
+        let phase = *self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(
+            phase,
+            ImageOperationPhase::Dispatched
+                | ImageOperationPhase::CancelledAfterDispatch
+                | ImageOperationPhase::Finished
+        ) {
+            crate::error::Error::new(
+                crate::error::ErrorKind::OutcomeUnknown,
+                "image.generate",
+                format!(
+                    "image turn '{turn_id}' was dispatched but its result was abandoned; outcome is unknown and the request was not retried"
+                ),
+            )
+        } else {
+            crate::error::Error::new(
+                crate::error::ErrorKind::Cancelled,
+                "image.generate",
+                format!("image turn '{turn_id}' was cancelled before dispatch"),
+            )
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(
+            *self
+                .phase
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ImageOperationPhase::CancelledBeforeDispatch
+                | ImageOperationPhase::CancelledAfterDispatch
+        )
+    }
+}
+
 pub(crate) async fn generate_via_endpoint(
     endpoint: String,
     auth: ChatGptImageAuth,
     request: DirectImageRequest,
     timeout: Duration,
     turn_id: String,
+    operation: Arc<ImageOperationState>,
 ) -> Result<DirectImageResponse, ImageEndpointError> {
     tokio::task::spawn_blocking(move || {
-        send_image_request(&endpoint, &auth, &request, timeout, &turn_id)
+        send_image_request(&endpoint, &auth, &request, timeout, &turn_id, &operation)
     })
     .await
     .map_err(|error| {
@@ -312,25 +464,31 @@ pub(crate) async fn generate_via_endpoint(
     })?
 }
 
+fn outcome_unknown_after_dispatch(
+    turn_id: &str,
+    cause: crate::error::Error,
+) -> crate::error::Error {
+    crate::error::Error::new(
+        crate::error::ErrorKind::OutcomeUnknown,
+        "image.generate",
+        format!(
+            "image turn '{turn_id}' was dispatched but its response could not be validated; outcome is unknown: {cause}"
+        ),
+    )
+}
+
 fn send_image_request(
     endpoint: &str,
     auth: &ChatGptImageAuth,
     request: &DirectImageRequest,
     timeout: Duration,
     turn_id: &str,
+    operation: &ImageOperationState,
 ) -> Result<DirectImageResponse, ImageEndpointError> {
-    if request.model.trim().is_empty() || request.model.len() > 160 || request.model.contains('\0')
-    {
-        return Err(ImageEndpointError::Failed(crate::error::Error::new(
-            crate::error::ErrorKind::InvalidInput,
-            "image.generate",
-            "image model must be a bounded non-empty value",
-        )));
-    }
     let body = serde_json::json!({
         "prompt": request.prompt,
         "background": request.background.as_str(),
-        "model": request.model,
+        "model": IMAGE_MODEL,
         "n": 1,
         "quality": request.quality.as_str(),
         "size": request.size.as_str(),
@@ -349,6 +507,9 @@ fn send_image_request(
             "image request body exceeds the bounded limit",
         )));
     }
+    operation
+        .begin_dispatch()
+        .map_err(ImageEndpointError::Failed)?;
     let agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)
@@ -367,16 +528,23 @@ fn send_image_request(
         .content_type("application/json")
         .send(&body_bytes)
         .map_err(|error| {
+            let kind = if operation.is_dispatched() {
+                crate::error::ErrorKind::OutcomeUnknown
+            } else {
+                crate::error::ErrorKind::Disconnected
+            };
             ImageEndpointError::Failed(crate::error::Error::new(
-                crate::error::ErrorKind::Disconnected,
+                kind,
                 "image.http",
                 format!("official image endpoint request failed: {error}"),
             ))
         })?;
     if response.status() == 401 {
+        operation.reset_after_unauthorized();
         return Err(ImageEndpointError::Unauthorized);
     }
     if response.status() != 200 {
+        operation.finish();
         return Err(ImageEndpointError::Failed(crate::error::Error::new(
             crate::error::ErrorKind::Rpc,
             "image.http",
@@ -392,13 +560,34 @@ fn send_image_request(
         .limit(MAX_IMAGE_JSON_BYTES as u64)
         .read_to_vec()
         .map_err(|error| {
-            ImageEndpointError::Failed(crate::error::Error::new(
-                crate::error::ErrorKind::Protocol,
-                "image.http",
-                format!("official image endpoint response could not be read: {error}"),
+            ImageEndpointError::Failed(outcome_unknown_after_dispatch(
+                turn_id,
+                crate::error::Error::new(
+                    crate::error::ErrorKind::Protocol,
+                    "image.http",
+                    format!("official image endpoint response could not be read: {error}"),
+                ),
             ))
         })?;
-    parse_image_endpoint_response(&bytes, request.background).map_err(ImageEndpointError::Failed)
+    if operation.is_cancelled() {
+        return Err(ImageEndpointError::Failed(
+            operation.cancellation_error(turn_id),
+        ));
+    }
+    match parse_image_endpoint_response(&bytes, request.background) {
+        Ok(parsed) => {
+            if operation.is_cancelled() {
+                return Err(ImageEndpointError::Failed(
+                    operation.cancellation_error(turn_id),
+                ));
+            }
+            operation.finish();
+            Ok(parsed)
+        }
+        Err(error) => Err(ImageEndpointError::Failed(outcome_unknown_after_dispatch(
+            turn_id, error,
+        ))),
+    }
 }
 
 pub(crate) fn image_turn_id() -> String {
@@ -490,6 +679,10 @@ fn validate_png(bytes: &[u8]) -> Result<PngInfo, crate::error::Error> {
     let mut offset = 8usize;
     let mut ihdr = None;
     let mut idat = Vec::new();
+    let mut idat_seen = false;
+    let mut idat_closed = false;
+    let mut palette: Option<Vec<u8>> = None;
+    let mut transparency: Option<Vec<u8>> = None;
     let mut saw_iend = false;
     while offset < bytes.len() {
         if bytes.len() - offset < 12 {
@@ -528,6 +721,13 @@ fn validate_png(bytes: &[u8]) -> Result<PngInfo, crate::error::Error> {
                 "PNG chunk CRC mismatch",
             ));
         }
+        if saw_iend {
+            return Err(crate::error::Error::new(
+                crate::error::ErrorKind::Protocol,
+                "image.http",
+                "PNG contains a chunk after IEND",
+            ));
+        }
         match chunk_type {
             b"IHDR" => {
                 if ihdr.is_some() || length != 13 || offset != 8 {
@@ -549,6 +749,7 @@ fn validate_png(bytes: &[u8]) -> Result<PngInfo, crate::error::Error> {
                     || !matches!(color_type, 0 | 2 | 3 | 4 | 6)
                     || data[10] != 0
                     || data[11] != 0
+                    || data[12] != 0
                 {
                     return Err(crate::error::Error::new(
                         crate::error::ErrorKind::Protocol,
@@ -556,16 +757,91 @@ fn validate_png(bytes: &[u8]) -> Result<PngInfo, crate::error::Error> {
                         "PNG IHDR dimensions or format are unsupported",
                     ));
                 }
+                let expected_raw = png_expected_raw_bytes(width, height, color_type)?;
+                if expected_raw > MAX_PNG_RAW_BYTES {
+                    return Err(crate::error::Error::new(
+                        crate::error::ErrorKind::ResourceLimit,
+                        "image.http",
+                        format!("PNG decompressed data exceeds {MAX_PNG_RAW_BYTES} bytes"),
+                    ));
+                }
                 ihdr = Some((width, height, color_type));
             }
-            b"IDAT" => {
-                if ihdr.is_none() {
+            b"PLTE" => {
+                let Some((_, _, color_type)) = ihdr else {
                     return Err(crate::error::Error::new(
                         crate::error::ErrorKind::Protocol,
                         "image.http",
-                        "PNG IDAT appears before IHDR",
+                        "PNG PLTE appears before IHDR",
+                    ));
+                };
+                if idat_seen
+                    || palette.is_some()
+                    || length == 0
+                    || length > 768
+                    || !length.is_multiple_of(3)
+                    || (color_type == 0 || color_type == 4)
+                {
+                    return Err(crate::error::Error::new(
+                        crate::error::ErrorKind::Protocol,
+                        "image.http",
+                        "PNG has an invalid or misplaced PLTE",
                     ));
                 }
+                palette = Some(data.to_vec());
+            }
+            b"tRNS" => {
+                let Some((_, _, color_type)) = ihdr else {
+                    return Err(crate::error::Error::new(
+                        crate::error::ErrorKind::Protocol,
+                        "image.http",
+                        "PNG tRNS appears before IHDR",
+                    ));
+                };
+                if idat_seen || transparency.is_some() {
+                    return Err(crate::error::Error::new(
+                        crate::error::ErrorKind::Protocol,
+                        "image.http",
+                        "PNG has a duplicate or misplaced tRNS",
+                    ));
+                }
+                let valid = match color_type {
+                    0 => length == 2 && data[0] == 0,
+                    2 => length == 6 && data.chunks_exact(2).all(|sample| sample[0] == 0),
+                    3 => palette
+                        .as_ref()
+                        .is_some_and(|colors| length <= colors.len() / 3 && length > 0),
+                    _ => false,
+                };
+                if !valid {
+                    return Err(crate::error::Error::new(
+                        crate::error::ErrorKind::Protocol,
+                        "image.http",
+                        "PNG has invalid transparency data",
+                    ));
+                }
+                transparency = Some(data.to_vec());
+            }
+            b"IDAT" => {
+                let Some((_, _, color_type)) = ihdr else {
+                    return Err(crate::error::Error::new(
+                        crate::error::ErrorKind::Protocol,
+                        "image.http",
+                        "PNG IDAT is missing IHDR",
+                    ));
+                };
+                if (color_type == 3 && palette.is_none()) || idat_closed {
+                    return Err(crate::error::Error::new(
+                        crate::error::ErrorKind::Protocol,
+                        "image.http",
+                        if color_type == 3 && palette.is_none() {
+                            "indexed PNG IDAT appears before PLTE"
+                        } else {
+                            "PNG IDAT is not contiguous"
+                        },
+                    ));
+                }
+                idat_seen = true;
                 idat.extend_from_slice(data);
                 if idat.len() > MAX_IMAGE_JSON_BYTES {
                     return Err(crate::error::Error::new(
@@ -576,7 +852,7 @@ fn validate_png(bytes: &[u8]) -> Result<PngInfo, crate::error::Error> {
                 }
             }
             b"IEND" => {
-                if length != 0 || idat.is_empty() {
+                if length != 0 || !idat_seen {
                     return Err(crate::error::Error::new(
                         crate::error::ErrorKind::Protocol,
                         "image.http",
@@ -592,7 +868,28 @@ fn validate_png(bytes: &[u8]) -> Result<PngInfo, crate::error::Error> {
                     ));
                 }
             }
-            _ => {}
+            _ => {
+                if ihdr.is_none() {
+                    return Err(crate::error::Error::new(
+                        crate::error::ErrorKind::Protocol,
+                        "image.http",
+                        "PNG contains a chunk before IHDR",
+                    ));
+                }
+                if chunk_type[0].is_ascii_uppercase() {
+                    return Err(crate::error::Error::new(
+                        crate::error::ErrorKind::Protocol,
+                        "image.http",
+                        "PNG contains an unknown critical chunk",
+                    ));
+                }
+                if idat_seen {
+                    idat_closed = true;
+                }
+            }
+        }
+        if !matches!(chunk_type, b"IDAT" | b"IEND") && idat_seen {
+            idat_closed = true;
         }
         offset = chunk_end;
     }
@@ -610,44 +907,16 @@ fn validate_png(bytes: &[u8]) -> Result<PngInfo, crate::error::Error> {
             "PNG is missing IEND",
         ));
     }
-    let channels = match color_type {
-        0 => 1,
-        2 => 3,
-        3 => 1,
-        4 => 2,
-        6 => 4,
-        _ => unreachable!(),
-    };
-    let expected_raw = (width as usize)
-        .checked_mul(channels)
-        .and_then(|row| row.checked_add(1))
-        .and_then(|row| row.checked_mul(height as usize))
-        .ok_or_else(|| {
-            crate::error::Error::new(
-                crate::error::ErrorKind::ResourceLimit,
-                "image.http",
-                "PNG dimensions exceed decoder bounds",
-            )
-        })?;
-    let decoder = ZlibDecoder::new(idat.as_slice());
-    let mut raw = Vec::with_capacity(expected_raw.min(MAX_IMAGE_JSON_BYTES));
-    decoder
-        .take(expected_raw as u64 + 1)
-        .read_to_end(&mut raw)
-        .map_err(|_| {
-            crate::error::Error::new(
-                crate::error::ErrorKind::Protocol,
-                "image.http",
-                "PNG IDAT is not valid zlib data",
-            )
-        })?;
-    if raw.len() != expected_raw {
+    if color_type == 3 && palette.is_none() {
         return Err(crate::error::Error::new(
             crate::error::ErrorKind::Protocol,
             "image.http",
-            "PNG decompressed data length does not match IHDR",
+            "indexed PNG is missing PLTE",
         ));
     }
+    let channels = png_channels(color_type);
+    let decoder = ZlibDecoder::new(idat.as_slice());
+    let mut decoder = decoder;
     let row_bytes = (width as usize).checked_mul(channels).ok_or_else(|| {
         crate::error::Error::new(
             crate::error::ErrorKind::ResourceLimit,
@@ -658,11 +927,33 @@ fn validate_png(bytes: &[u8]) -> Result<PngInfo, crate::error::Error> {
     let mut previous = vec![0u8; row_bytes];
     let mut current = vec![0u8; row_bytes];
     let mut has_transparent_pixels = false;
-    for row in 0..height as usize {
-        let row_start = row * (row_bytes + 1);
-        let filter = raw[row_start];
-        let filtered = &raw[row_start + 1..row_start + 1 + row_bytes];
-        for (index, value) in filtered.iter().copied().enumerate() {
+    let transparent_gray = transparency
+        .as_deref()
+        .filter(|_| color_type == 0)
+        .map(|value| value[1]);
+    let transparent_rgb = transparency
+        .as_deref()
+        .filter(|_| color_type == 2)
+        .map(|value| [value[1], value[3], value[5]]);
+    let palette = palette.as_deref();
+    for _row in 0..height as usize {
+        let mut filter = [0u8; 1];
+        decoder.read_exact(&mut filter).map_err(|_| {
+            crate::error::Error::new(
+                crate::error::ErrorKind::Protocol,
+                "image.http",
+                "PNG IDAT is not valid zlib data",
+            )
+        })?;
+        decoder.read_exact(&mut current).map_err(|_| {
+            crate::error::Error::new(
+                crate::error::ErrorKind::Protocol,
+                "image.http",
+                "PNG decompressed data length does not match IHDR",
+            )
+        })?;
+        for index in 0..row_bytes {
+            let value = current[index];
             let left = if index >= channels {
                 current[index - channels]
             } else {
@@ -674,7 +965,7 @@ fn validate_png(bytes: &[u8]) -> Result<PngInfo, crate::error::Error> {
             } else {
                 0
             };
-            current[index] = match filter {
+            current[index] = match filter[0] {
                 0 => value,
                 1 => value.wrapping_add(left),
                 2 => value.wrapping_add(up),
@@ -689,20 +980,91 @@ fn validate_png(bytes: &[u8]) -> Result<PngInfo, crate::error::Error> {
                 }
             };
         }
-        if matches!(color_type, 4 | 6) {
-            let alpha_offset = if color_type == 4 { 1 } else { 3 };
-            let pixel_channels = channels;
-            has_transparent_pixels |= (0..width as usize)
-                .any(|pixel| current[pixel * pixel_channels + alpha_offset] < u8::MAX);
+        for pixel in 0..width as usize {
+            let start = pixel * channels;
+            has_transparent_pixels |= match color_type {
+                0 => transparent_gray.is_some_and(|sample| current[start] == sample),
+                2 => transparent_rgb.is_some_and(|sample| current[start..start + 3] == sample),
+                3 => {
+                    let index = current[start] as usize;
+                    let Some(palette) = palette else {
+                        return Err(crate::error::Error::new(
+                            crate::error::ErrorKind::Protocol,
+                            "image.http",
+                            "indexed PNG is missing PLTE",
+                        ));
+                    };
+                    if index >= palette.len() / 3 {
+                        return Err(crate::error::Error::new(
+                            crate::error::ErrorKind::Protocol,
+                            "image.http",
+                            "indexed PNG pixel is outside PLTE",
+                        ));
+                    }
+                    transparency
+                        .as_deref()
+                        .is_some_and(|alpha| alpha.get(index).copied().unwrap_or(u8::MAX) < u8::MAX)
+                }
+                4 => current[start + 1] < u8::MAX,
+                6 => current[start + 3] < u8::MAX,
+                _ => false,
+            };
         }
         std::mem::swap(&mut previous, &mut current);
+    }
+    let mut extra = [0u8; 1];
+    match decoder.read(&mut extra) {
+        Ok(0) => {}
+        Ok(_) => {
+            return Err(crate::error::Error::new(
+                crate::error::ErrorKind::Protocol,
+                "image.http",
+                "PNG decompressed data contains trailing bytes",
+            ));
+        }
+        Err(_) => {
+            return Err(crate::error::Error::new(
+                crate::error::ErrorKind::Protocol,
+                "image.http",
+                "PNG IDAT is not valid zlib data",
+            ));
+        }
     }
     Ok(PngInfo {
         width,
         height,
-        alpha_capable: matches!(color_type, 4 | 6),
+        alpha_capable: matches!(color_type, 4 | 6) || transparency.is_some(),
         has_transparent_pixels,
     })
+}
+
+fn png_channels(color_type: u8) -> usize {
+    match color_type {
+        0 | 3 => 1,
+        2 => 3,
+        4 => 2,
+        6 => 4,
+        _ => unreachable!(),
+    }
+}
+
+fn png_expected_raw_bytes(
+    width: u32,
+    height: u32,
+    color_type: u8,
+) -> Result<usize, crate::error::Error> {
+    let channels = png_channels(color_type);
+    (width as usize)
+        .checked_mul(channels)
+        .and_then(|row| row.checked_add(1))
+        .and_then(|row| row.checked_mul(height as usize))
+        .ok_or_else(|| {
+            crate::error::Error::new(
+                crate::error::ErrorKind::ResourceLimit,
+                "image.http",
+                "PNG dimensions exceed decoder bounds",
+            )
+        })
 }
 
 fn paeth_predictor(left: u8, up: u8, upper_left: u8) -> u8 {
@@ -779,6 +1141,57 @@ mod tests {
     }
 
     fn png(color_type: u8, row: &[u8]) -> Vec<u8> {
+        png_with_interlace(color_type, row, 0)
+    }
+
+    fn png_with_interlace(color_type: u8, row: &[u8], interlace: u8) -> Vec<u8> {
+        let mut compressed = Vec::new();
+        let mut encoder = ZlibEncoder::new(&mut compressed, Compression::default());
+        encoder.write_all(row).expect("compress row");
+        encoder.finish().expect("finish compressed row");
+        let mut output = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, color_type, 0, 0, interlace]);
+        output.extend_from_slice(&chunk(b"IHDR", &ihdr));
+        output.extend_from_slice(&chunk(b"IDAT", &compressed));
+        output.extend_from_slice(&chunk(b"IEND", &[]));
+        output
+    }
+
+    fn png_with_dimensions(color_type: u8, width: u32, height: u32) -> Vec<u8> {
+        let channels = match color_type {
+            0 | 3 => 1,
+            2 => 3,
+            4 => 2,
+            6 => 4,
+            _ => panic!("unsupported test color type"),
+        };
+        let row = vec![0u8; width as usize * channels + 1];
+        let mut compressed = Vec::new();
+        let mut encoder = ZlibEncoder::new(&mut compressed, Compression::default());
+        for _ in 0..height {
+            encoder.write_all(&row).expect("compress row");
+        }
+        encoder.finish().expect("finish compressed rows");
+        let mut output = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, color_type, 0, 0, 0]);
+        output.extend_from_slice(&chunk(b"IHDR", &ihdr));
+        output.extend_from_slice(&chunk(b"IDAT", &compressed));
+        output.extend_from_slice(&chunk(b"IEND", &[]));
+        output
+    }
+
+    fn png_with_chunks(
+        color_type: u8,
+        row: &[u8],
+        before_idat: &[(&[u8; 4], &[u8])],
+        after_idat: &[(&[u8; 4], &[u8])],
+    ) -> Vec<u8> {
         let mut compressed = Vec::new();
         let mut encoder = ZlibEncoder::new(&mut compressed, Compression::default());
         encoder.write_all(row).expect("compress row");
@@ -789,7 +1202,13 @@ mod tests {
         ihdr.extend_from_slice(&1u32.to_be_bytes());
         ihdr.extend_from_slice(&[8, color_type, 0, 0, 0]);
         output.extend_from_slice(&chunk(b"IHDR", &ihdr));
+        for (kind, data) in before_idat {
+            output.extend_from_slice(&chunk(kind, data));
+        }
         output.extend_from_slice(&chunk(b"IDAT", &compressed));
+        for (kind, data) in after_idat {
+            output.extend_from_slice(&chunk(kind, data));
+        }
         output.extend_from_slice(&chunk(b"IEND", &[]));
         output
     }
@@ -856,7 +1275,6 @@ mod tests {
 
     fn request() -> DirectImageRequest {
         DirectImageRequest {
-            model: "gpt-image-1".to_owned(),
             prompt: "a red fox isolated on transparent background".to_owned(),
             background: ImageBackground::Transparent,
             size: ImageSize::Square,
@@ -890,12 +1308,14 @@ mod tests {
         .expect("response JSON");
         let server = serve_once(listener, 200, response);
         let turn_id = image_turn_id();
+        let operation = ImageOperationState::new();
         let result = send_image_request(
             &format!("http://{address}/images/generations"),
             &auth("account-test"),
             &request(),
             Duration::from_secs(5),
             &turn_id,
+            &operation,
         )
         .expect("image response");
         let request_bytes = server.join().expect("server thread");
@@ -913,7 +1333,7 @@ mod tests {
                 + 4..],
         );
         let body: Value = serde_json::from_str(&body).expect("request body JSON");
-        assert_eq!(body["model"], "gpt-image-1");
+        assert_eq!(body["model"], "gpt-image-2");
         assert_eq!(body["n"], 1);
         assert_eq!(body["background"], "transparent");
         assert_eq!(body["size"], "1024x1024");
@@ -953,12 +1373,14 @@ mod tests {
         });
         let endpoint = format!("http://{address}/images/generations");
         let turn_id = image_turn_id();
+        let first_operation = ImageOperationState::new();
         let first_result = send_image_request(
             &endpoint,
             &auth("account-test"),
             &request(),
             Duration::from_secs(5),
             &turn_id,
+            &first_operation,
         );
         assert!(matches!(
             first_result,
@@ -970,6 +1392,7 @@ mod tests {
             &request(),
             Duration::from_secs(5),
             &turn_id,
+            &first_operation,
         )
         .expect("one refresh retry response");
         assert!(second_result.alpha_capable());
@@ -1000,16 +1423,18 @@ mod tests {
             thread::sleep(Duration::from_millis(250));
         });
         let started = std::time::Instant::now();
+        let operation = ImageOperationState::new();
         let result = send_image_request(
             &format!("http://{address}/images/generations"),
             &auth("account-test"),
             &request(),
             Duration::from_millis(50),
             &image_turn_id(),
+            &operation,
         );
         let elapsed = started.elapsed();
         assert!(
-            matches!(result, Err(ImageEndpointError::Failed(error)) if error.kind() == crate::error::ErrorKind::Disconnected)
+            matches!(result, Err(ImageEndpointError::Failed(error)) if error.kind() == crate::error::ErrorKind::OutcomeUnknown)
         );
         assert!(elapsed < Duration::from_millis(200), "elapsed={elapsed:?}");
         server.join().expect("server");
@@ -1020,18 +1445,66 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("local listener");
         let address = listener.local_addr().expect("listener address");
         let server = serve_once(listener, 429, Vec::new());
+        let operation = ImageOperationState::new();
         let result = send_image_request(
             &format!("http://{address}/images/generations"),
             &auth("account-test"),
             &request(),
             Duration::from_secs(5),
             &image_turn_id(),
+            &operation,
         );
         assert!(
             matches!(result, Err(ImageEndpointError::Failed(error)) if error.kind() == crate::error::ErrorKind::Rpc)
         );
         let request_bytes = server.join().expect("server");
         assert!(String::from_utf8_lossy(&request_bytes).contains("POST /images/generations"));
+    }
+
+    #[test]
+    fn dispatched_http_200_validation_failures_are_unknown_and_not_replayed() {
+        let image = png(6, &[0, 255, 0, 0, 0]);
+        let mut invalid_crc = image.clone();
+        let crc = invalid_crc.len() - 1;
+        invalid_crc[crc] ^= 1;
+        let responses = [
+            b"not-json".to_vec(),
+            serde_json::to_vec(&json!({
+                "data": [{"b64_json": "not-base64"}]
+            }))
+            .expect("invalid data JSON"),
+            serde_json::to_vec(&json!({
+                "data": [{"b64_json": BASE64_STANDARD.encode(invalid_crc)}]
+            }))
+            .expect("invalid PNG JSON"),
+        ];
+
+        for (index, response) in responses.into_iter().enumerate() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("local listener");
+            let address = listener.local_addr().expect("listener address");
+            let server = serve_once(listener, 200, response);
+            let turn_id = format!("invalid-image-turn-{index}");
+            let operation = ImageOperationState::new();
+            let result = send_image_request(
+                &format!("http://{address}/images/generations"),
+                &auth("account-test"),
+                &request(),
+                Duration::from_secs(5),
+                &turn_id,
+                &operation,
+            );
+            assert!(matches!(
+                result,
+                Err(ImageEndpointError::Failed(error))
+                    if error.kind() == crate::error::ErrorKind::OutcomeUnknown
+                        && error.message().contains(&turn_id)
+            ));
+            assert!(matches!(
+                operation.begin_dispatch(),
+                Err(error) if error.kind() == crate::error::ErrorKind::Protocol
+            ));
+            server.join().expect("server thread");
+        }
     }
 
     #[test]
@@ -1081,6 +1554,193 @@ mod tests {
             .expect("opaque RGBA PNG remains valid");
         assert!(parsed.alpha_capable());
         assert_eq!(parsed.transparent_background(), Some(false));
+    }
+
+    #[test]
+    fn png_raw_limit_is_checked_before_decompression_and_exact_limit_is_valid() {
+        let exact = png_with_dimensions(0, 8191, 1792);
+        assert!(validate_png(&exact).is_ok());
+
+        // RGBA dimensions below the 8192-pixel side limit can still encode
+        // exactly one byte above the raw ceiling.
+        let over = png_with_dimensions(6, 451, 8133);
+        let error = validate_png(&over).expect_err("raw PNG limit");
+        assert_eq!(error.kind(), crate::error::ErrorKind::ResourceLimit);
+        assert!(error.message().contains("14680064"));
+    }
+
+    #[test]
+    fn png_chunk_order_palette_transparency_and_critical_names_are_strict() {
+        let palette = [0, 0, 0, 255, 0, 0];
+        let valid_indexed = png_with_chunks(3, &[0, 1], &[(b"PLTE", &palette)], &[]);
+        assert!(validate_png(&valid_indexed).is_ok());
+        let indexed_transparent = png_with_chunks(
+            3,
+            &[0, 1],
+            &[(b"PLTE", &palette), (b"tRNS", &[255, 0])],
+            &[],
+        );
+        let indexed_info = validate_png(&indexed_transparent).expect("valid indexed tRNS");
+        assert!(indexed_info.alpha_capable);
+        assert!(indexed_info.has_transparent_pixels);
+
+        let missing_palette = png(3, &[0, 0]);
+        assert!(validate_png(&missing_palette).is_err());
+
+        let late_palette = png_with_chunks(3, &[0, 0], &[], &[(b"PLTE", &palette)]);
+        assert!(validate_png(&late_palette).is_err());
+
+        let duplicate_palette =
+            png_with_chunks(3, &[0, 0], &[(b"PLTE", &palette), (b"PLTE", &palette)], &[]);
+        assert!(validate_png(&duplicate_palette).is_err());
+
+        let invalid_trns = [255, 0, 0];
+        let invalid_transparency =
+            png_with_chunks(6, &[0, 255, 0, 0, 0], &[(b"tRNS", &invalid_trns)], &[]);
+        assert!(validate_png(&invalid_transparency).is_err());
+
+        let unknown_critical = png_with_chunks(6, &[0, 255, 0, 0, 0], &[(b"ABCD", &[])], &[]);
+        assert!(validate_png(&unknown_critical).is_err());
+
+        let noncontiguous_idat = png_with_chunks(
+            6,
+            &[0, 255, 0, 0, 0],
+            &[],
+            &[(b"tEXt", b"note"), (b"IDAT", &[])],
+        );
+        assert!(validate_png(&noncontiguous_idat).is_err());
+
+        let adam7 = png_with_interlace(6, &[0, 255, 0, 0, 0], 1);
+        assert!(validate_png(&adam7).is_err());
+    }
+
+    #[test]
+    fn png_rgb_and_rgba_formats_remain_supported() {
+        assert!(validate_png(&png(2, &[0, 255, 0, 0])).is_ok());
+        assert!(validate_png(&png(6, &[0, 255, 0, 0, 255])).is_ok());
+    }
+
+    #[test]
+    fn billed_image_operation_fences_pre_and_post_dispatch_cancellation() {
+        let operation = ImageOperationState::new();
+        assert!(!operation.cancel());
+        assert_eq!(
+            operation.cancellation_error("pre-dispatch-turn").kind(),
+            crate::error::ErrorKind::Cancelled
+        );
+        assert!(matches!(
+            operation.begin_dispatch(),
+            Err(error) if error.kind() == crate::error::ErrorKind::Cancelled
+        ));
+
+        let operation = ImageOperationState::new();
+        operation.begin_dispatch().expect("dispatch ownership");
+        assert!(operation.cancel());
+        assert_eq!(
+            operation.cancellation_error("turn-1").kind(),
+            crate::error::ErrorKind::OutcomeUnknown
+        );
+        operation.finish();
+        assert_eq!(
+            operation.cancellation_error("finished-turn").kind(),
+            crate::error::ErrorKind::OutcomeUnknown
+        );
+        assert!(matches!(
+            operation.begin_dispatch(),
+            Err(error) if error.kind() == crate::error::ErrorKind::Cancelled
+        ));
+    }
+
+    #[tokio::test]
+    async fn billed_image_worker_reports_unknown_after_server_receives_request() {
+        use std::io::ErrorKind as IoErrorKind;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("local listener");
+        let address = listener.local_addr().expect("listener address");
+        let (received_tx, received_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let release_for_server = Arc::clone(&release);
+        let accepted_for_server = Arc::clone(&accepted);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("request connection");
+            accepted_for_server.fetch_add(1, Ordering::Release);
+            let _request = read_http_request(&stream);
+            received_tx.send(()).expect("received signal");
+            while !release_for_server.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("response");
+
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let deadline = std::time::Instant::now() + Duration::from_millis(100);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((extra, _)) => {
+                        accepted_for_server.fetch_add(1, Ordering::Release);
+                        let _ = extra.shutdown(std::net::Shutdown::Both);
+                    }
+                    Err(error) if error.kind() == IoErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("unexpected second accept error: {error}"),
+                }
+            }
+        });
+
+        let operation = ImageOperationState::new();
+        let worker_operation = Arc::clone(&operation);
+        let endpoint = format!("http://{address}/images/generations");
+        let turn_id = "delayed-image-turn".to_owned();
+        let worker = tokio::task::spawn_blocking(move || {
+            send_image_request(
+                &endpoint,
+                &auth("account-test"),
+                &request(),
+                Duration::from_secs(5),
+                &turn_id,
+                &worker_operation,
+            )
+        });
+        received_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("server observed request");
+        assert!(
+            operation.cancel(),
+            "dispatch must be owned before cancellation"
+        );
+        release.store(true, Ordering::Release);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("image worker must finish after cancellation")
+            .expect("image worker task");
+        assert!(matches!(
+            result,
+            Err(ImageEndpointError::Failed(error))
+                if error.kind() == crate::error::ErrorKind::OutcomeUnknown
+                    && error.message().contains("delayed-image-turn")
+        ));
+        let second = send_image_request(
+            &format!("http://{address}/images/generations"),
+            &auth("account-test"),
+            &request(),
+            Duration::from_secs(1),
+            "delayed-image-turn",
+            &operation,
+        );
+        assert!(matches!(
+            second,
+            Err(ImageEndpointError::Failed(error))
+                if error.kind() == crate::error::ErrorKind::Cancelled
+        ));
+        server.join().expect("server thread");
+        assert_eq!(accepted.load(Ordering::Acquire), 1);
     }
 }
 

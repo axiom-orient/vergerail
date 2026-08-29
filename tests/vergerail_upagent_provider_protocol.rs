@@ -50,7 +50,6 @@ fn image_request(reasoning: &str) -> Value {
 fn execute(value: &Value) -> Output {
     let mut child = Command::new(provider())
         .env_remove("VERGERAIL_CODEX_PACKAGE")
-        .env_remove("VERGERAIL_CODEX_HOME")
         .env_remove("VERGERAIL_MODEL")
         .env_remove("VERGERAIL_WORKSPACE")
         .stdin(Stdio::piped())

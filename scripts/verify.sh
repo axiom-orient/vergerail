@@ -27,6 +27,12 @@ if grep -R -n -E 'VERGERAIL_HOME_OWNER|with_home_owner|ManagedHome' \
     exit 1
 fi
 
+if grep -R -n -E 'VERGERAIL_CODEX_HOME|with_codex_home|managed_home|managedHome' \
+    src examples docs README.md SECURITY.md; then
+    echo "retired dedicated-home surface detected" >&2
+    exit 1
+fi
+
 if grep -n -E 'VERGERAIL_GUARDIAN_LEGACY_MUTANT|survivor-probe|first-empty-scan' \
     src/native/vergerail_guardian.c; then
     echo "test mutation surface leaked into production guardian" >&2
@@ -55,10 +61,6 @@ if [ "$release" -eq 1 ]; then
         echo "release external proof requires VERGERAIL_CODEX_PACKAGE" >&2
         exit 1
     fi
-    if [ -z "${VERGERAIL_CODEX_HOME:-}" ] || [ ! -d "${VERGERAIL_CODEX_HOME:-}" ]; then
-        echo "release external proof requires an existing VERGERAIL_CODEX_HOME" >&2
-        exit 1
-    fi
     if [ -z "${VERGERAIL_MODEL:-}" ]; then
         echo "release external proof requires VERGERAIL_MODEL" >&2
         exit 1
@@ -84,6 +86,15 @@ cargo clippy --offline --locked --all-targets -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --offline --locked --no-deps
 cargo deny check
 (cd protocol/codex-0.150.1 && shasum -a 256 -c SHA256SUMS)
+if [ "$release" -eq 1 ]; then
+    package_listing=$(cargo package --offline --locked --list)
+else
+    package_listing=$(cargo package --offline --locked --allow-dirty --list)
+fi
+if ! printf '%s\n' "$package_listing" | grep -Fq 'tests/fixtures/guardian_survivor_mutant.c'; then
+    echo "guardian survivor fixture is missing from the canonical package listing" >&2
+    exit 1
+fi
 if [ "$release" -eq 1 ]; then
     cargo package --offline --locked
 else

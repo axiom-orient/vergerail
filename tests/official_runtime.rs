@@ -4,6 +4,40 @@ use vergerail::{
     Account, Codex, CodexConfig, DownloadPolicy, RuntimeOrigin, RuntimePackage, RuntimeResolver,
 };
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use serde_json::Value;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::path::PathBuf;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::process::Stdio;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::time::{Duration, Instant};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use tokio::io::AsyncWriteExt as _;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use tokio::time::timeout;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn provider_binary() -> PathBuf {
+    std::env::var_os("CARGO_BIN_EXE_vergerail-upagent-provider")
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_vergerail_upagent_provider"))
+        .map(PathBuf::from)
+        .expect("Cargo must expose the vergerail-upagent-provider test binary")
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn installed_runtime_root() -> Option<PathBuf> {
+    std::env::var_os("VERGERAIL_CODEX_PACKAGE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home).join(
+                    "Library/Application Support/vergerail/runtimes/codex/0.150.1/aarch64-apple-darwin",
+                )
+            })
+        })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VERGERAIL_CODEX_PACKAGE pointing at the official 0.150.1 macOS package"]
 async fn connects_to_pinned_official_runtime_and_reuses_standard_account() {
@@ -41,4 +75,94 @@ async fn resolver_reuses_an_audited_system_install_without_downloading() {
         .expect("reuse audited system package");
     assert_eq!(resolved.origin(), RuntimeOrigin::System);
     assert_eq!(resolved.package().root(), expected_root);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_runtime_verification_deadline_reaps_the_guardian_helper() {
+    let Some(package_root) = installed_runtime_root() else {
+        eprintln!("skipping runtime helper proof: HOME is not set");
+        return;
+    };
+    if !package_root.is_dir() {
+        eprintln!(
+            "skipping runtime helper proof: package is not installed at {}",
+            package_root.display()
+        );
+        return;
+    }
+    let temporary_root = std::env::temp_dir();
+    let existing_helpers = std::fs::read_dir(&temporary_root)
+        .expect("temporary directory")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".vergerail-runtime-verify-")
+        })
+        .count();
+    assert_eq!(existing_helpers, 0, "no prior verifier helper may survive");
+
+    let request = serde_json::json!({
+        "schemaVersion": 1,
+        "requestId": "runtime-helper-timeout",
+        "operation": "model_turn",
+        "messages": [{"role": "user", "content": "unused"}],
+        "tools": [],
+        "reasoning": "off",
+        "timeoutMs": 100,
+        "maximumResponseBytes": 1024
+    });
+    let started = Instant::now();
+    let mut child = tokio::process::Command::new(provider_binary())
+        .env("VERGERAIL_CODEX_PACKAGE", &package_root)
+        .env("VERGERAIL_MODEL", "gpt-5.6-luna")
+        .env("VERGERAIL_WORKSPACE", "/tmp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("provider process must start");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(
+            serde_json::to_string(&request)
+                .expect("request JSON")
+                .as_bytes(),
+        )
+        .await
+        .expect("request input");
+    let output = timeout(Duration::from_secs(8), child.wait_with_output())
+        .await
+        .expect("provider deadline must be bounded")
+        .expect("provider process must exit");
+    assert!(
+        output.status.success(),
+        "typed timeout must be a process success"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "provider protocol must stay on stdout"
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).expect("strict response");
+    assert_eq!(response["error"]["code"], "timeout");
+    assert!(started.elapsed() < Duration::from_secs(8));
+
+    let remaining_helpers = std::fs::read_dir(&temporary_root)
+        .expect("temporary directory")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".vergerail-runtime-verify-")
+        })
+        .count();
+    assert_eq!(
+        remaining_helpers, 0,
+        "guardian helper artifacts must be removed"
+    );
 }

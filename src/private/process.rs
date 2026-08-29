@@ -9,6 +9,8 @@ use serde_json::Value;
 use std::env;
 use std::fmt;
 use std::process::Stdio;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
@@ -19,6 +21,13 @@ use tokio::time::{Duration, timeout};
 
 const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
 const OVERSIZED_STDERR_LINE: &str = "<oversized stderr line omitted>";
+#[cfg(test)]
+static SPAWN_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn test_spawn_attempts() -> usize {
+    SPAWN_ATTEMPTS.load(Ordering::Acquire)
+}
 
 pub(crate) enum ProcessEvent {
     Message(Incoming),
@@ -60,6 +69,7 @@ struct ProcessInner {
     cleanup_finished: AtomicBool,
     shutdown_timeout: Duration,
     send_timeout: Duration,
+    deadline: Option<std::time::Instant>,
     max_frame_bytes: usize,
 }
 
@@ -70,6 +80,37 @@ impl ProcessInner {
         self.tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn remaining_timeout(&self) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+            .map_or(Some(self.send_timeout), |remaining| {
+                (!remaining.is_zero()).then_some(remaining.min(self.send_timeout))
+            })
+    }
+
+    fn cleanup_deadline(&self) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        let budget_deadline = now.checked_add(self.shutdown_timeout).unwrap_or(now);
+        match self.deadline {
+            Some(operation_deadline) if operation_deadline > now => {
+                operation_deadline.min(budget_deadline)
+            }
+            _ => budget_deadline,
+        }
+    }
+
+    fn remaining_cleanup_timeout(cleanup_deadline: std::time::Instant) -> Duration {
+        cleanup_deadline.saturating_duration_since(std::time::Instant::now())
+    }
+}
+
+fn ensure_deadline(deadline: Option<std::time::Instant>, operation: &'static str) -> Result<()> {
+    if deadline.is_some_and(|deadline| deadline <= std::time::Instant::now()) {
+        Err(Error::timeout(operation, Duration::ZERO))
+    } else {
+        Ok(())
     }
 }
 
@@ -133,6 +174,10 @@ impl ProcessHandle {
         runtime: &VerifiedRuntime,
         config: &CodexConfig,
     ) -> Result<(Self, mpsc::Receiver<ProcessEvent>)> {
+        runtime
+            .reverify_before_spawn_with_deadline(config.absolute_deadline)
+            .await?;
+        ensure_deadline(config.absolute_deadline, "runtime.spawn")?;
         let guardian_directory =
             process_tree::create_guardian_directory(&env::temp_dir(), "vergerail-runtime")
                 .map_err(|error| {
@@ -188,15 +233,6 @@ impl ProcessHandle {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        match config.codex_home.as_ref() {
-            Some(home) => {
-                command.env("CODEX_HOME", home);
-            }
-            None => {
-                command.env_remove("CODEX_HOME");
-            }
-        }
-
         let bundled_path = runtime.root.join("codex-path");
         let mut path_segments = vec![bundled_path];
         if let Some(current) = env::var_os("PATH") {
@@ -213,6 +249,9 @@ impl ProcessHandle {
         })?;
         command.env("PATH", path);
 
+        ensure_deadline(config.absolute_deadline, "runtime.spawn")?;
+        #[cfg(test)]
+        SPAWN_ATTEMPTS.fetch_add(1, Ordering::AcqRel);
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -297,6 +336,7 @@ impl ProcessHandle {
             cleanup_finished: AtomicBool::new(false),
             shutdown_timeout: config.shutdown_timeout,
             send_timeout: config.request_timeout,
+            deadline: config.absolute_deadline,
             max_frame_bytes: config.max_frame_bytes,
         });
 
@@ -332,7 +372,11 @@ impl ProcessHandle {
         }
 
         let frame = EncodedFrame::encode(&value, self.inner.max_frame_bytes)?;
-        let permit = match timeout(self.inner.send_timeout, self.inner.outbound.reserve()).await {
+        let send_timeout = self
+            .inner
+            .remaining_timeout()
+            .ok_or_else(|| Error::timeout("process.send", self.inner.send_timeout))?;
+        let permit = match timeout(send_timeout, self.inner.outbound.reserve()).await {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => {
                 return Err(Error::new(
@@ -342,10 +386,7 @@ impl ProcessHandle {
                 ));
             }
             Err(_) => {
-                return Err(Error::timeout(
-                    "process.send.queue",
-                    self.inner.send_timeout,
-                ));
+                return Err(Error::timeout("process.send.queue", send_timeout));
             }
         };
         if self.inner.shutdown_started.load(Ordering::Acquire) {
@@ -360,7 +401,11 @@ impl ProcessHandle {
         dispatched.store(true, Ordering::Release);
         permit.send(Outbound::Frame { frame, ack: ack_tx });
 
-        match timeout(self.inner.send_timeout, ack_rx).await {
+        let send_timeout = self
+            .inner
+            .remaining_timeout()
+            .ok_or_else(|| Error::timeout("process.send", self.inner.send_timeout))?;
+        match timeout(send_timeout, ack_rx).await {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(error))) => Err(self
                 .outcome_unknown_after_dispatch(format!("app-server stdin write failed: {error}"))
@@ -373,14 +418,17 @@ impl ProcessHandle {
             Err(_) => Err(self
                 .outcome_unknown_after_dispatch(format!(
                     "no write acknowledgement arrived within {} ms",
-                    self.inner.send_timeout.as_millis()
+                    send_timeout.as_millis()
                 ))
                 .await),
         }
     }
 
     async fn outcome_unknown_after_dispatch(&self, reason: String) -> Error {
-        let termination = self.force_kill().await.err();
+        let termination = self
+            .force_kill_with_deadline(self.inner.cleanup_deadline())
+            .await
+            .err();
         let message = termination.map_or_else(
             || format!("{reason}; runtime termination was initiated"),
             |error| format!("{reason}; runtime termination failed: {error}"),
@@ -392,28 +440,55 @@ impl ProcessHandle {
         self.inner.stderr.tail()
     }
 
-    pub(crate) async fn stderr_tail_after_close(&self) -> Option<String> {
+    pub(crate) async fn stderr_tail_after_close(
+        &self,
+        cleanup_deadline: std::time::Instant,
+    ) -> Option<String> {
         self.inner
             .stderr
-            .tail_after_close(self.inner.shutdown_timeout.min(Duration::from_secs(1)))
+            .tail_after_close(
+                ProcessInner::remaining_cleanup_timeout(cleanup_deadline)
+                    .min(Duration::from_secs(1)),
+            )
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn shutdown(&self) -> Result<()> {
+        self.shutdown_with_deadline(self.inner.cleanup_deadline())
+            .await
+    }
+
+    pub(crate) async fn shutdown_with_deadline(
+        &self,
+        cleanup_deadline: std::time::Instant,
+    ) -> Result<()> {
         if self.inner.cleanup_finished.load(Ordering::Acquire) {
             return Ok(());
         }
         self.inner.shutdown_started.store(true, Ordering::Release);
 
         let mut failures = Vec::new();
+        let operation_expired = self
+            .inner
+            .deadline
+            .is_some_and(|deadline| deadline <= std::time::Instant::now());
+        let close_timeout = || {
+            let remaining = ProcessInner::remaining_cleanup_timeout(cleanup_deadline);
+            if operation_expired {
+                remaining.min(Duration::from_millis(100))
+            } else {
+                remaining
+            }
+        };
         let (ack_tx, ack_rx) = oneshot::channel();
         match timeout(
-            self.inner.shutdown_timeout,
+            close_timeout(),
             self.inner.outbound.send(Outbound::Close { ack: ack_tx }),
         )
         .await
         {
-            Ok(Ok(())) => match timeout(self.inner.shutdown_timeout, ack_rx).await {
+            Ok(Ok(())) => match timeout(close_timeout(), ack_rx).await {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(error))) => failures.push(error.to_string()),
                 Ok(Err(_)) => {
@@ -425,40 +500,76 @@ impl ProcessHandle {
             Err(_) => failures.push("timed out queueing app-server stdin close".to_owned()),
         }
 
-        let mut child_guard = self.inner.child.lock().await;
-        if let Some(child) = child_guard.as_mut() {
-            match timeout(self.inner.shutdown_timeout, child.wait()).await {
-                Ok(Ok(status)) if status.success() => {}
-                Ok(Ok(status)) => failures.push(format!(
-                    "app-server exited unsuccessfully during shutdown: {status}"
-                )),
-                Ok(Err(error)) => failures.push(format!("failed waiting for app-server: {error}")),
-                Err(_) => {
-                    failures.push(
-                        "guardian did not exit after stdin was closed; TERM was sent".to_owned(),
-                    );
-                    if let Err(error) = process_tree::terminate(self.inner.identity, child) {
-                        failures.push(format!("failed to terminate owned guardian: {error}"));
-                    }
-                    match timeout(self.inner.shutdown_timeout, child.wait()).await {
-                        Ok(Ok(_status)) => {}
-                        Ok(Err(error)) => {
-                            failures.push(format!("failed to reap killed app-server: {error}"));
+        if operation_expired {
+            if let Err(error) = self.force_kill_with_deadline(cleanup_deadline).await {
+                failures.push(format!(
+                    "failed to force and reap expired app-server: {error}"
+                ));
+            }
+        } else {
+            let mut child_guard = self.inner.child.lock().await;
+            let mut child_reaped = true;
+            if let Some(child) = child_guard.as_mut() {
+                child_reaped = false;
+                match timeout(
+                    ProcessInner::remaining_cleanup_timeout(cleanup_deadline),
+                    child.wait(),
+                )
+                .await
+                {
+                    Ok(Ok(status)) => {
+                        child_reaped = true;
+                        if !status.success() {
+                            failures.push(format!(
+                                "app-server exited unsuccessfully during shutdown: {status}"
+                            ));
                         }
-                        Err(_) => failures.push("timed out reaping killed app-server".to_owned()),
+                    }
+                    Ok(Err(error)) => {
+                        failures.push(format!("failed waiting for app-server: {error}"));
+                    }
+                    Err(_) => {
+                        failures.push(
+                            "guardian did not exit after stdin was closed; TERM was sent"
+                                .to_owned(),
+                        );
+                        if let Err(error) = process_tree::terminate(self.inner.identity, child) {
+                            failures.push(format!("failed to terminate owned guardian: {error}"));
+                        }
+                        match timeout(
+                            ProcessInner::remaining_cleanup_timeout(cleanup_deadline),
+                            child.wait(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_status)) => child_reaped = true,
+                            Ok(Err(error)) => {
+                                failures.push(format!("failed to reap killed app-server: {error}"));
+                            }
+                            Err(_) => {
+                                failures.push("timed out reaping killed app-server".to_owned());
+                            }
+                        }
                     }
                 }
             }
+            if child_reaped {
+                *child_guard = None;
+            }
+            drop(child_guard);
         }
-        *child_guard = None;
-        drop(child_guard);
 
         let tasks = {
             let mut tasks = self.inner.tasks();
             std::mem::take(&mut *tasks)
         };
         for mut task in tasks {
-            match timeout(self.inner.shutdown_timeout, &mut task).await {
+            match timeout(
+                ProcessInner::remaining_cleanup_timeout(cleanup_deadline),
+                &mut task,
+            )
+            .await
+            {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => failures.push(format!("process task failed: {error}")),
                 Err(_) => {
@@ -489,6 +600,14 @@ impl ProcessHandle {
     }
 
     pub(crate) async fn force_kill(&self) -> Result<()> {
+        self.force_kill_with_deadline(self.inner.cleanup_deadline())
+            .await
+    }
+
+    pub(crate) async fn force_kill_with_deadline(
+        &self,
+        cleanup_deadline: std::time::Instant,
+    ) -> Result<()> {
         self.inner.shutdown_started.store(true, Ordering::Release);
         let mut child_guard = self.inner.child.lock().await;
         let Some(child) = child_guard.as_mut() else {
@@ -505,7 +624,12 @@ impl ProcessHandle {
                 format!("failed to terminate owned guardian: {error}"),
             )
         })?;
-        match timeout(self.inner.shutdown_timeout, child.wait()).await {
+        match timeout(
+            ProcessInner::remaining_cleanup_timeout(cleanup_deadline),
+            child.wait(),
+        )
+        .await
+        {
             Ok(Ok(_status)) => {
                 *child_guard = None;
                 process_tree::remove_guardian(&self.inner.guardian_path).map_err(|error| {
@@ -572,6 +696,7 @@ impl ProcessHandle {
             cleanup_finished: AtomicBool::new(false),
             shutdown_timeout: send_timeout,
             send_timeout,
+            deadline: None,
             max_frame_bytes,
         });
         let task = tokio::spawn(writer_loop(

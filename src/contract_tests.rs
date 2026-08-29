@@ -15,6 +15,8 @@ use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
@@ -37,7 +39,6 @@ for raw in sys.stdin:
     method = message.get("method")
     request_id = message.get("id")
     if method == "initialize":
-        assert "CODEX_HOME" not in os.environ
         send({"id": request_id, "result": {"userAgent": "fake"}})
         send({"method": "configWarning", "params": {"summary": "fake config warning"}})
         send({"id": 901, "method": "item/tool/call", "params": {"threadId": "missing"}})
@@ -540,7 +541,10 @@ for raw in sys.stdin:
 
 fn read_image_http_request(mut stream: &TcpStream) -> Vec<u8> {
     stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
+        .set_nonblocking(false)
+        .expect("set image request stream blocking");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("set image request read timeout");
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 4096];
@@ -623,13 +627,10 @@ async fn image_generation_exercises_app_server_auth_refresh_and_http_retry() {
     });
 
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let home_directory = tempfile::tempdir().expect("home tempdir");
     let package = create_fake_package(package_directory.path(), IMAGE_AUTH_SCRIPT);
     let config = CodexConfig::new(package)
-        .with_codex_home(home_directory.path())
-        .expect("explicit auth home")
         .with_image_generation(true)
-        .with_request_timeout(Duration::from_secs(3));
+        .with_request_timeout(Duration::from_secs(10));
     let mut codex = Codex::connect(config)
         .await
         .expect("connect fixture app-server");
@@ -637,7 +638,6 @@ async fn image_generation_exercises_app_server_auth_refresh_and_http_retry() {
 
     let error = codex
         .generate_image(DirectImageRequest {
-            model: "gpt-image-1".to_owned(),
             prompt: "fixture image".to_owned(),
             background: ImageBackground::Transparent,
             size: ImageSize::Square,
@@ -760,13 +760,13 @@ async fn complete_contract_uses_real_process_and_bidirectional_rpc() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn inherited_codex_home_is_removed_before_app_server_spawn() {
-    const CHILD_MARKER: &str = "VERGERAIL_AUTH_ENV_REMOVAL_CHILD";
+async fn inherited_codex_home_reaches_app_server_spawn() {
+    const CHILD_MARKER: &str = "VERGERAIL_AUTH_ENV_FORWARDING_CHILD";
 
     if std::env::var_os(CHILD_MARKER).is_none() {
         let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
             .arg("--exact")
-            .arg("contract_tests::inherited_codex_home_is_removed_before_app_server_spawn")
+            .arg("contract_tests::inherited_codex_home_reaches_app_server_spawn")
             .arg("--test-threads=1")
             .env(CHILD_MARKER, "1")
             .env("CODEX_HOME", "/vergerail-test-sentinel")
@@ -781,35 +781,25 @@ async fn inherited_codex_home_is_removed_before_app_server_spawn() {
         Ok("/vergerail-test-sentinel")
     );
     let package_directory = tempfile::tempdir().expect("package tempdir");
-    let package = create_fake_package(package_directory.path(), SCRIPT);
-    let codex = Codex::connect(CodexConfig::new(package))
-        .await
-        .expect("child CODEX_HOME must be removed");
-    codex.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explicit_codex_home_is_forwarded_to_app_server_spawn() {
-    let home_directory = tempfile::tempdir().expect("home tempdir");
-    let expected_home = serde_json::to_string(
-        home_directory
+    let expected_home = serde_json::to_string("/vergerail-test-sentinel")
+        .expect("Codex home sentinel must serialize");
+    let package_root = serde_json::to_string(
+        package_directory
             .path()
             .to_str()
-            .expect("home path must be UTF-8"),
+            .expect("package path must be UTF-8"),
     )
-    .expect("home JSON string");
+    .expect("package path must serialize");
     let script = SCRIPT.replace(
-        "assert \"CODEX_HOME\" not in os.environ",
-        &format!("assert os.environ.get(\"CODEX_HOME\") == {expected_home}"),
+        "if method == \"initialize\":",
+        &format!(
+            "if method == \"initialize\":\n        assert os.environ.get(\"CODEX_HOME\") == {expected_home}\n        assert os.getcwd() != {package_root}"
+        ),
     );
-    let package_directory = tempfile::tempdir().expect("package tempdir");
     let package = create_fake_package(package_directory.path(), &script);
-    let config = CodexConfig::new(package)
-        .with_codex_home(home_directory.path())
-        .expect("explicit home");
-    let codex = Codex::connect(config)
+    let codex = Codex::connect(CodexConfig::new(package))
         .await
-        .expect("explicit Codex home must reach the child app-server");
+        .expect("app-server must receive the Codex-selected home");
     codex.shutdown().await.expect("shutdown");
 }
 
@@ -1849,6 +1839,35 @@ for raw in sys.stdin:
 mark("shutdown-stdin-closed")
 "###;
 
+const EXPIRED_DEADLINE_CLEANUP_SCRIPT: &str = r###"#!/usr/bin/env python3
+import json
+import os
+import signal
+import sys
+import time
+
+if len(sys.argv) == 2 and sys.argv[1] == "--version":
+    print("codex-cli 0.test")
+    raise SystemExit(0)
+
+home = __MARKER_ROOT__
+with open(os.path.join(home, "expired-cleanup-pid"), "w", encoding="utf-8") as marker:
+    marker.write(str(os.getpid()))
+
+def send(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+for raw in sys.stdin:
+    message = json.loads(raw)
+    if message.get("method") == "initialize":
+        send({"id": message.get("id"), "result": {}})
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+while True:
+    time.sleep(1)
+"###;
+
 const MALFORMED_NOTIFICATION_SCRIPT: &str = r###"#!/usr/bin/env python3
 import json
 import sys
@@ -2555,6 +2574,77 @@ async fn cancelling_shutdown_caller_does_not_cancel_owned_cleanup() {
     .expect("owned cleanup must continue after caller cancellation");
 
     drop(session);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_operation_deadline_uses_bounded_cleanup_and_reaps_guardian() {
+    let package_directory = tempfile::tempdir().expect("package tempdir");
+    let marker_directory = tempfile::tempdir().expect("marker tempdir");
+    let script = with_marker_root(EXPIRED_DEADLINE_CLEANUP_SCRIPT, marker_directory.path());
+    let package = create_fake_package(package_directory.path(), &script);
+    let operation_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let config = CodexConfig::new(package)
+        .with_absolute_deadline(operation_deadline)
+        .with_shutdown_timeout(Duration::from_secs(2));
+    let codex = Codex::connect(config).await.expect("connect fixture");
+
+    let pid_marker = marker_directory.path().join("expired-cleanup-pid");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !pid_marker.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fixture must publish its pid");
+    let pid: u32 = fs::read_to_string(&pid_marker)
+        .expect("fixture pid")
+        .trim()
+        .parse()
+        .expect("numeric fixture pid");
+
+    tokio::time::sleep(Duration::from_millis(3_100)).await;
+    let started = std::time::Instant::now();
+    let _shutdown = tokio::time::timeout(Duration::from_secs(4), codex.shutdown())
+        .await
+        .expect("expired operation cleanup must remain bounded");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "cleanup exceeded its bounded reap window"
+    );
+
+    for _ in 0..200 {
+        let pid_text = pid.to_string();
+        let present = Command::new("/bin/ps")
+            .args(["-p", &pid_text, "-o", "pid="])
+            .output()
+            .expect("ps fixture pid")
+            .stdout
+            .iter()
+            .any(|byte| !byte.is_ascii_whitespace());
+        if !present {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let pid_text = pid.to_string();
+    let present = Command::new("/bin/ps")
+        .args(["-p", &pid_text, "-o", "pid="])
+        .output()
+        .expect("ps fixture pid")
+        .stdout
+        .iter()
+        .any(|byte| !byte.is_ascii_whitespace());
+    assert!(!present, "fixture worker survived bounded guardian cleanup");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let present_later = Command::new("/bin/ps")
+        .args(["-p", &pid_text, "-o", "pid="])
+        .output()
+        .expect("ps fixture pid after delay")
+        .stdout
+        .iter()
+        .any(|byte| !byte.is_ascii_whitespace());
+    assert!(!present_later, "fixture worker reappeared after cleanup");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

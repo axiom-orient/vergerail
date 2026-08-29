@@ -2,14 +2,15 @@
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::runtime::RuntimePackage;
-use std::path::{Component, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const MIN_FRAME_BYTES: usize = 64 * 1024;
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 /// Complete configuration required to connect to a pinned app-server runtime.
 #[derive(Clone, Debug)]
 pub struct CodexConfig {
     pub(crate) runtime: RuntimePackage,
-    pub(crate) codex_home: Option<PathBuf>,
     pub(crate) client_name: String,
     pub(crate) client_title: String,
     pub(crate) request_timeout: Duration,
@@ -21,15 +22,21 @@ pub struct CodexConfig {
     pub(crate) event_capacity: usize,
     pub(crate) stderr_capacity: usize,
     pub(crate) image_generation: bool,
+    pub(crate) absolute_deadline: Option<Instant>,
 }
 
 impl CodexConfig {
+    /// Smallest JSONL frame accepted by the app-server transport.
+    pub const MIN_FRAME_BYTES: usize = MIN_FRAME_BYTES;
+
+    /// Largest JSONL frame accepted by the app-server transport.
+    pub const MAX_FRAME_BYTES: usize = MAX_FRAME_BYTES;
+
     /// Creates a configuration that reuses the standard Codex account home.
     #[must_use]
     pub fn new(runtime: RuntimePackage) -> Self {
         Self {
             runtime,
-            codex_home: None,
             client_name: "vergerail".to_owned(),
             client_title: "Vergerail".to_owned(),
             request_timeout: Duration::from_secs(30),
@@ -41,29 +48,8 @@ impl CodexConfig {
             event_capacity: 256,
             stderr_capacity: 64 * 1024,
             image_generation: false,
+            absolute_deadline: None,
         }
-    }
-
-    /// Uses the explicitly selected Codex account state for the child
-    /// app-server process. The directory is never created or copied by
-    /// Vergerail; callers must provision and authenticate it separately.
-    pub fn with_codex_home(mut self, home: impl Into<PathBuf>) -> Result<Self> {
-        let home = home.into();
-        if !home.is_absolute()
-            || home.as_os_str().is_empty()
-            || home.to_string_lossy().contains('\0')
-            || home
-                .components()
-                .any(|component| component == Component::ParentDir)
-        {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "CodexConfig::with_codex_home",
-                "Codex home must be an absolute path without parent traversal",
-            ));
-        }
-        self.codex_home = Some(home);
-        Ok(self)
     }
 
     /// Sets the client title reported during the initialize handshake.
@@ -91,6 +77,14 @@ impl CodexConfig {
         self
     }
 
+    /// Sets one monotonic deadline shared by runtime verification, requests,
+    /// operations, and shutdown. Intended for process-boundary adapters.
+    #[must_use]
+    pub fn with_absolute_deadline(mut self, deadline: Instant) -> Self {
+        self.absolute_deadline = Some(deadline);
+        self
+    }
+
     /// Sets the deadline for resolving reverse approval requests.
     #[must_use]
     pub const fn with_approval_timeout(mut self, timeout: Duration) -> Self {
@@ -114,11 +108,11 @@ impl CodexConfig {
 
     /// Sets the maximum accepted or emitted JSONL frame size.
     pub fn with_max_frame_bytes(mut self, bytes: usize) -> Result<Self> {
-        if bytes < 64 * 1024 {
+        if !(Self::MIN_FRAME_BYTES..=Self::MAX_FRAME_BYTES).contains(&bytes) {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "CodexConfig::with_max_frame_bytes",
-                "frame limit must be at least 64 KiB",
+                "frame limit must be between 64 KiB and 64 MiB",
             ));
         }
         self.max_frame_bytes = bytes;
@@ -147,11 +141,11 @@ impl CodexConfig {
                 ));
             }
         }
-        if self.max_frame_bytes < 64 * 1024 {
+        if !(Self::MIN_FRAME_BYTES..=Self::MAX_FRAME_BYTES).contains(&self.max_frame_bytes) {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "CodexConfig::validate",
-                "frame limit must be at least 64 KiB",
+                "frame limit must be between 64 KiB and 64 MiB",
             ));
         }
         for (name, value) in [
@@ -213,10 +207,41 @@ mod tests {
 
     #[test]
     fn validates_frame_limit_and_capacities() {
+        let config = config_for_validation();
+        assert_eq!(CodexConfig::MIN_FRAME_BYTES, 64 * 1024);
+        assert_eq!(CodexConfig::MAX_FRAME_BYTES, 64 * 1024 * 1024);
+        assert!(
+            config
+                .clone()
+                .with_max_frame_bytes(CodexConfig::MIN_FRAME_BYTES)
+                .is_ok()
+        );
+        assert!(
+            config
+                .clone()
+                .with_max_frame_bytes(CodexConfig::MAX_FRAME_BYTES)
+                .is_ok()
+        );
+        assert_eq!(
+            config
+                .clone()
+                .with_max_frame_bytes(CodexConfig::MAX_FRAME_BYTES + 1)
+                .expect_err("frame limit above canonical maximum")
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+
         let mut config = config_for_validation();
-        config.max_frame_bytes = 64 * 1024 - 1;
+        config.max_frame_bytes = CodexConfig::MIN_FRAME_BYTES - 1;
         assert_eq!(
             config.validate().expect_err("small frame limit").kind(),
+            ErrorKind::InvalidInput
+        );
+
+        let mut config = config_for_validation();
+        config.max_frame_bytes = CodexConfig::MAX_FRAME_BYTES + 1;
+        assert_eq!(
+            config.validate().expect_err("large frame limit").kind(),
             ErrorKind::InvalidInput
         );
 
@@ -225,27 +250,6 @@ mod tests {
         assert_eq!(
             config.validate().expect_err("zero event capacity").kind(),
             ErrorKind::InvalidInput
-        );
-    }
-
-    #[test]
-    fn codex_home_override_requires_a_clean_absolute_path() {
-        let config = config_for_validation()
-            .with_codex_home("/tmp/vergerail-managed-home")
-            .expect("absolute managed home");
-        assert_eq!(
-            config.codex_home.as_deref(),
-            Some(std::path::Path::new("/tmp/vergerail-managed-home"))
-        );
-        assert!(
-            config_for_validation()
-                .with_codex_home("relative-home")
-                .is_err()
-        );
-        assert!(
-            config_for_validation()
-                .with_codex_home("/tmp/../outside")
-                .is_err()
         );
     }
 }

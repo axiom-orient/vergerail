@@ -7,16 +7,21 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use tokio::io::{AsyncRead, AsyncReadExt as _};
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+use tokio::process::Child;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 mod lock;
@@ -30,8 +35,565 @@ const PINNED_SCHEMA: &[u8] =
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const VERSION_OUTPUT_LIMIT: usize = 8 * 1024;
 const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
+const VERIFICATION_CLEANUP_BUDGET: Duration = Duration::from_secs(2);
+const VERIFICATION_READ_CHUNK_BYTES: usize = 128 * 1024;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+const VERIFICATION_HELPER_ARGUMENT: &str = "--vergerail-runtime-verify";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const VERSION_CLEANUP_GRACE: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Debug)]
+struct VerificationControl {
+    cancelled: Arc<AtomicBool>,
+    active_workers: Arc<AtomicUsize>,
+    started_workers: Arc<AtomicUsize>,
+    #[cfg(test)]
+    checkpoint_delay: Option<Duration>,
+}
+
+impl VerificationControl {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            active_workers: Arc::new(AtomicUsize::new(0)),
+            started_workers: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            checkpoint_delay: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn slow_for_test(delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            active_workers: Arc::new(AtomicUsize::new(0)),
+            started_workers: Arc::new(AtomicUsize::new(0)),
+            checkpoint_delay: Some(delay),
+        })
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn checkpoint(&self, operation: &'static str) -> Result<()> {
+        #[cfg(test)]
+        if let Some(delay) = self.checkpoint_delay {
+            let started = Instant::now();
+            while started.elapsed() < delay {
+                if self.cancelled.load(Ordering::Acquire) {
+                    return Err(Error::timeout(operation, Duration::ZERO));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        if self.cancelled.load(Ordering::Acquire) {
+            Err(Error::timeout(operation, Duration::ZERO))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn begin_worker(&self) -> VerificationWorkerGuard<'_> {
+        self.started_workers.fetch_add(1, Ordering::Relaxed);
+        self.active_workers.fetch_add(1, Ordering::AcqRel);
+        VerificationWorkerGuard { control: self }
+    }
+}
+
+struct VerificationWorkerGuard<'a> {
+    control: &'a VerificationControl,
+}
+
+impl Drop for VerificationWorkerGuard<'_> {
+    fn drop(&mut self) {
+        self.control.active_workers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct VerificationJob {
+    control: Arc<VerificationControl>,
+    handle: Option<JoinHandle<Result<VerifiedRuntime>>>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+    process: Option<VerificationProcess>,
+}
+
+impl VerificationJob {
+    fn spawn(
+        package: RuntimePackage,
+        control: Arc<VerificationControl>,
+        deadline: Option<Instant>,
+        operation: &'static str,
+    ) -> Result<Self> {
+        if let Some(deadline) = deadline {
+            remaining_deadline(deadline, operation)?;
+        }
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+        {
+            if deadline.is_some() {
+                return VerificationProcess::spawn(package, Arc::clone(&control)).map(|process| {
+                    Self {
+                        control,
+                        handle: None,
+                        process: Some(process),
+                    }
+                });
+            }
+
+            let worker_control = Arc::clone(&control);
+            let handle = tokio::task::spawn_blocking(move || {
+                let _worker = worker_control.begin_worker();
+                verify_filesystem_with_control(package, &worker_control)
+            });
+            Ok(Self {
+                control,
+                handle: Some(handle),
+                process: None,
+            })
+        }
+
+        #[cfg(any(test, not(all(target_os = "macos", target_arch = "aarch64"))))]
+        {
+            let worker_control = Arc::clone(&control);
+            let handle = tokio::task::spawn_blocking(move || {
+                let _worker = worker_control.begin_worker();
+                verify_filesystem_with_control(package, &worker_control)
+            });
+            Ok(Self {
+                control,
+                handle: Some(handle),
+            })
+        }
+    }
+
+    #[allow(unused_mut)]
+    async fn join_with_deadline(
+        mut self,
+        deadline: Option<Instant>,
+        operation: &'static str,
+    ) -> Result<VerifiedRuntime> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+        {
+            if let Some(process) = self.process.take() {
+                self.join_process_with_deadline(process, deadline, operation)
+                    .await
+            } else {
+                self.join_blocking_with_deadline(deadline, operation).await
+            }
+        }
+
+        #[cfg(any(test, not(all(target_os = "macos", target_arch = "aarch64"))))]
+        {
+            self.join_blocking_with_deadline(deadline, operation).await
+        }
+    }
+
+    async fn join_blocking_with_deadline(
+        self,
+        deadline: Option<Instant>,
+        operation: &'static str,
+    ) -> Result<VerifiedRuntime> {
+        let control = self.control;
+        let mut handle = self
+            .handle
+            .expect("verification blocking job must own its worker handle");
+        let Some(deadline) = deadline else {
+            return join_verification_handle(handle, operation).await;
+        };
+        let remaining = match remaining_deadline(deadline, operation) {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                control.cancel();
+                let cleanup = timeout(VERIFICATION_CLEANUP_BUDGET, &mut handle).await;
+                if cleanup.is_err() {
+                    handle.abort();
+                }
+                return Err(error);
+            }
+        };
+        match timeout(remaining, &mut handle).await {
+            Ok(result) => join_verification_result(result, operation),
+            Err(_) => {
+                control.cancel();
+                let cleanup = timeout(VERIFICATION_CLEANUP_BUDGET, &mut handle).await;
+                if cleanup.is_err() {
+                    handle.abort();
+                    return Err(Error::new(
+                        ErrorKind::RuntimeVerification,
+                        operation,
+                        format!(
+                            "verification cancellation exceeded {} ms before acknowledgement",
+                            VERIFICATION_CLEANUP_BUDGET.as_millis()
+                        ),
+                    ));
+                }
+                Err(Error::timeout(operation, remaining))
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+    async fn join_process_with_deadline(
+        mut self,
+        process: VerificationProcess,
+        deadline: Option<Instant>,
+        operation: &'static str,
+    ) -> Result<VerifiedRuntime> {
+        self.process = Some(process);
+        let Some(deadline) = deadline else {
+            return self.finish_process(operation).await;
+        };
+        let remaining = match remaining_deadline(deadline, operation) {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                self.control.cancel();
+                let cleanup = self
+                    .process
+                    .as_mut()
+                    .expect("verification process must remain owned")
+                    .terminate()
+                    .await;
+                return Err(with_verification_cleanup(error, cleanup));
+            }
+        };
+        match timeout(
+            remaining,
+            self.process
+                .as_mut()
+                .expect("verification process must remain owned")
+                .child
+                .wait(),
+        )
+        .await
+        {
+            Ok(Ok(status)) => self.finish_process_status(status, operation).await,
+            Ok(Err(error)) => {
+                let cleanup = self
+                    .process
+                    .as_mut()
+                    .expect("verification process must remain owned")
+                    .terminate()
+                    .await;
+                Err(Error::new(
+                    ErrorKind::RuntimeVerification,
+                    operation,
+                    format!("verification helper wait failed: {error}{cleanup}"),
+                ))
+            }
+            Err(_) => {
+                self.control.cancel();
+                let cleanup = self
+                    .process
+                    .as_mut()
+                    .expect("verification process must remain owned")
+                    .terminate()
+                    .await;
+                let error = Error::timeout(operation, remaining);
+                if cleanup.is_empty() {
+                    Err(error)
+                } else {
+                    Err(Error::new(
+                        ErrorKind::Timeout,
+                        operation,
+                        format!("{}{}", error.message(), cleanup),
+                    ))
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+    async fn finish_process(&mut self, operation: &'static str) -> Result<VerifiedRuntime> {
+        let status = match self
+            .process
+            .as_mut()
+            .expect("verification process must remain owned")
+            .child
+            .wait()
+            .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                let cleanup = self
+                    .process
+                    .as_mut()
+                    .expect("verification process must remain owned")
+                    .terminate()
+                    .await;
+                return Err(Error::new(
+                    ErrorKind::RuntimeVerification,
+                    operation,
+                    format!("verification helper wait failed: {error}{cleanup}"),
+                ));
+            }
+        };
+        self.finish_process_status(status, operation).await
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+    async fn finish_process_status(
+        &mut self,
+        status: std::process::ExitStatus,
+        operation: &'static str,
+    ) -> Result<VerifiedRuntime> {
+        let stderr = match timeout(
+            VERSION_CLEANUP_GRACE,
+            &mut self
+                .process
+                .as_mut()
+                .expect("verification process must remain owned")
+                .stderr_task,
+        )
+        .await
+        {
+            Ok(Ok(Ok(output))) if !output.overflowed => {
+                String::from_utf8_lossy(&output.bytes).trim().to_owned()
+            }
+            Ok(Ok(Ok(_))) => "verification helper stderr exceeded its limit".to_owned(),
+            Ok(Ok(Err(error))) => format!("verification helper stderr failed: {error}"),
+            Ok(Err(error)) => format!("verification helper stderr task failed: {error}"),
+            Err(_) => {
+                self.process
+                    .as_mut()
+                    .expect("verification process must remain owned")
+                    .stderr_task
+                    .abort();
+                "verification helper stderr remained open after exit".to_owned()
+            }
+        };
+        let cleanup = self
+            .process
+            .as_ref()
+            .expect("verification process must remain owned")
+            .cleanup_artifacts();
+        if !status.success() {
+            return Err(Error::new(
+                ErrorKind::RuntimeVerification,
+                operation,
+                format!(
+                    "verification helper exited with {status}: {}{}",
+                    if stderr.is_empty() {
+                        "no diagnostic"
+                    } else {
+                        &stderr
+                    },
+                    cleanup
+                ),
+            ));
+        }
+        if !stderr.is_empty() {
+            return Err(Error::new(
+                ErrorKind::RuntimeVerification,
+                operation,
+                format!("verification helper emitted a diagnostic: {stderr}{cleanup}"),
+            ));
+        }
+        if !cleanup.is_empty() {
+            return Err(Error::new(
+                ErrorKind::RuntimeVerification,
+                "runtime.guardian",
+                cleanup.trim_start_matches(';').trim().to_owned(),
+            ));
+        }
+        let process = self
+            .process
+            .as_ref()
+            .expect("verification process must remain owned");
+        let root = process.package.root.canonicalize().map_err(|error| {
+            Error::new(
+                ErrorKind::RuntimeVerification,
+                operation,
+                format!("cannot canonicalize verified package root: {error}"),
+            )
+        })?;
+        Ok(VerifiedRuntime {
+            entrypoint: root.join(&process.package.lock.entrypoint),
+            root,
+            lock: process.package.lock.clone(),
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+struct VerificationProcess {
+    child: Child,
+    identity: process_tree::ProcessIdentity,
+    guardian_path: PathBuf,
+    guardian_directory: PathBuf,
+    stderr_task: JoinHandle<Result<BoundedOutput>>,
+    package: RuntimePackage,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+impl VerificationProcess {
+    fn spawn(package: RuntimePackage, _control: Arc<VerificationControl>) -> Result<Self> {
+        let helper = env::current_exe().map_err(|error| {
+            Error::new(
+                ErrorKind::RuntimeVerification,
+                "runtime.verify.helper",
+                format!("cannot locate packaged provider verifier: {error}"),
+            )
+        })?;
+        if helper.file_stem().and_then(|name| name.to_str()) != Some("vergerail-upagent-provider") {
+            return Err(Error::new(
+                ErrorKind::RuntimeVerification,
+                "runtime.verify.helper",
+                "the packaged provider verifier is unavailable in the current executable",
+            ));
+        }
+        let guardian_directory =
+            process_tree::create_guardian_directory(&env::temp_dir(), "vergerail-runtime-verify")
+                .map_err(|error| {
+                Error::new(
+                    ErrorKind::RuntimeVerification,
+                    "runtime.guardian",
+                    format!("cannot create runtime verification guardian directory: {error}"),
+                )
+            })?;
+        let guardian_path = match process_tree::extract_guardian(&guardian_directory) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = process_tree::remove_guardian_directory(&guardian_directory);
+                return Err(Error::new(
+                    ErrorKind::RuntimeVerification,
+                    "runtime.guardian",
+                    format!("cannot materialize runtime verification guardian: {error}"),
+                ));
+            }
+        };
+        let root = if package.root.is_absolute() {
+            package.root.clone()
+        } else {
+            match env::current_dir() {
+                Ok(current) => current.join(&package.root),
+                Err(error) => {
+                    let _ = process_tree::remove_guardian(&guardian_path);
+                    let _ = process_tree::remove_guardian_directory(&guardian_directory);
+                    return Err(Error::new(
+                        ErrorKind::RuntimeVerification,
+                        "runtime.verify.helper",
+                        format!("cannot resolve relative runtime package root: {error}"),
+                    ));
+                }
+            }
+        };
+        let mut command = process_tree::command(&guardian_path, &helper);
+        command
+            .arg(VERIFICATION_HELPER_ARGUMENT)
+            .arg(root)
+            .env_clear()
+            .current_dir(env::temp_dir())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = process_tree::remove_guardian(&guardian_path);
+                let _ = process_tree::remove_guardian_directory(&guardian_directory);
+                return Err(Error::new(
+                    ErrorKind::RuntimeVerification,
+                    "runtime.verify.helper",
+                    format!("failed to execute runtime verification guardian: {error}"),
+                ));
+            }
+        };
+        let identity = match process_tree::capture(&child) {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = child.start_kill();
+                let _ = process_tree::remove_guardian(&guardian_path);
+                let _ = process_tree::remove_guardian_directory(&guardian_directory);
+                return Err(Error::new(
+                    ErrorKind::RuntimeVerification,
+                    "runtime.verify.helper",
+                    format!("cannot capture runtime verification guardian identity: {error}"),
+                ));
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                let _ = child.start_kill();
+                let _ = process_tree::remove_guardian(&guardian_path);
+                let _ = process_tree::remove_guardian_directory(&guardian_directory);
+                return Err(Error::new(
+                    ErrorKind::RuntimeVerification,
+                    "runtime.verify.helper",
+                    "runtime verification guardian stderr was not piped",
+                ));
+            }
+        };
+        let stderr_task = tokio::spawn(read_bounded_output(stderr, VERSION_OUTPUT_LIMIT));
+        Ok(Self {
+            child,
+            identity,
+            guardian_path,
+            guardian_directory,
+            stderr_task,
+            package,
+        })
+    }
+
+    async fn terminate(&mut self) -> String {
+        let kill_error = process_tree::terminate(self.identity, &mut self.child).err();
+        self.stderr_task.abort();
+        let wait = timeout(VERSION_CLEANUP_GRACE, self.child.wait()).await;
+        let mut result = match (kill_error, wait) {
+            (None, Ok(Ok(_))) => String::new(),
+            (Some(error), Ok(Ok(_))) => format!("; guardian termination failed: {error}"),
+            (None, Ok(Err(error))) => format!("; guardian reap failed: {error}"),
+            (Some(kill), Ok(Err(reap))) => {
+                format!("; guardian termination failed: {kill}; guardian reap failed: {reap}")
+            }
+            (None, Err(_)) => "; guardian cleanup exceeded 1000 ms".to_owned(),
+            (Some(error), Err(_)) => {
+                format!("; guardian termination failed: {error}; cleanup exceeded 1000 ms")
+            }
+        };
+        result.push_str(&self.cleanup_artifacts());
+        result
+    }
+
+    fn cleanup_artifacts(&self) -> String {
+        cleanup_version_artifacts(&self.guardian_path, &self.guardian_directory)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+fn with_verification_cleanup(error: Error, cleanup: String) -> Error {
+    if cleanup.is_empty() {
+        error
+    } else {
+        Error::new(
+            error.kind(),
+            error.operation(),
+            format!("{}{}", error.message(), cleanup),
+        )
+    }
+}
+
+async fn join_verification_handle(
+    handle: JoinHandle<Result<VerifiedRuntime>>,
+    operation: &'static str,
+) -> Result<VerifiedRuntime> {
+    join_verification_result(handle.await, operation)
+}
+
+fn join_verification_result(
+    result: std::result::Result<Result<VerifiedRuntime>, tokio::task::JoinError>,
+    operation: &'static str,
+) -> Result<VerifiedRuntime> {
+    result.map_err(|error| {
+        Error::new(
+            ErrorKind::RuntimeVerification,
+            operation,
+            format!("verification worker failed: {error}"),
+        )
+    })?
+}
 
 /// A canonical Codex package root plus its required identity.
 #[derive(Clone, Debug)]
@@ -87,22 +649,57 @@ impl RuntimePackage {
         self.lock.protocol_schema_canonical_sha256()
     }
 
+    /// Verifies the package manifest, layout, permissions, sizes, and hashes
+    /// without launching the app-server. The packaged UpAgent verifier uses
+    /// this method inside the guardian-owned verification process.
+    #[doc(hidden)]
+    pub fn verify_filesystem(&self) -> Result<()> {
+        verify_protocol_schema(&self.lock)?;
+        verify_host_target(&self.lock.target)?;
+        verify_filesystem(self.clone()).map(|_| ())
+    }
+
     pub(crate) async fn verify(&self) -> Result<VerifiedRuntime> {
+        self.verify_with_timeout(VERSION_TIMEOUT).await
+    }
+
+    pub(crate) async fn verify_with_deadline(&self, deadline: Instant) -> Result<VerifiedRuntime> {
         verify_protocol_schema(&self.lock)?;
         verify_host_target(&self.lock.target)?;
 
-        let package = self.clone();
-        let verified = tokio::task::spawn_blocking(move || verify_filesystem(package))
-            .await
-            .map_err(|error| {
-                Error::new(
-                    ErrorKind::RuntimeVerification,
-                    "runtime.verify",
-                    format!("verification worker failed: {error}"),
-                )
-            })??;
+        let verified = VerificationJob::spawn(
+            self.clone(),
+            VerificationControl::new(),
+            Some(deadline),
+            "runtime.verify",
+        )?
+        .join_with_deadline(Some(deadline), "runtime.verify")
+        .await?;
 
-        verify_version(&verified.entrypoint, &self.lock.version).await?;
+        let version_timeout = deadline.saturating_duration_since(Instant::now());
+        if version_timeout.is_zero() {
+            return Err(Error::timeout("runtime.version", Duration::ZERO));
+        }
+        verify_version_with_timeout(&verified.entrypoint, &self.lock.version, version_timeout)
+            .await?;
+        Ok(verified)
+    }
+
+    async fn verify_with_timeout(&self, version_timeout: Duration) -> Result<VerifiedRuntime> {
+        verify_protocol_schema(&self.lock)?;
+        verify_host_target(&self.lock.target)?;
+
+        let verified = VerificationJob::spawn(
+            self.clone(),
+            VerificationControl::new(),
+            None,
+            "runtime.verify",
+        )?
+        .join_with_deadline(None, "runtime.verify")
+        .await?;
+
+        let remaining = version_timeout;
+        verify_version_with_timeout(&verified.entrypoint, &self.lock.version, remaining).await?;
         Ok(verified)
     }
 }
@@ -111,6 +708,81 @@ impl RuntimePackage {
 pub(crate) struct VerifiedRuntime {
     pub(crate) root: PathBuf,
     pub(crate) entrypoint: PathBuf,
+    pub(crate) lock: RuntimeLock,
+}
+
+impl VerifiedRuntime {
+    #[cfg(test)]
+    pub(crate) fn reverify_before_spawn(&self) -> Result<()> {
+        let verified =
+            verify_filesystem(RuntimePackage::new(self.root.clone(), self.lock.clone()))?;
+        if verified.entrypoint != self.entrypoint {
+            return Err(Error::new(
+                ErrorKind::RuntimeVerification,
+                "runtime.spawn",
+                "runtime entrypoint changed after verification",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn reverify_before_spawn_with_deadline(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        let verified = VerificationJob::spawn(
+            RuntimePackage::new(self.root.clone(), self.lock.clone()),
+            VerificationControl::new(),
+            deadline,
+            "runtime.spawn",
+        )?
+        .join_with_deadline(deadline, "runtime.spawn")
+        .await?;
+        if let Some(deadline) = deadline {
+            remaining_deadline(deadline, "runtime.spawn")?;
+        }
+        if verified.entrypoint != self.entrypoint {
+            return Err(Error::new(
+                ErrorKind::RuntimeVerification,
+                "runtime.spawn",
+                "runtime entrypoint changed after verification",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn reverify_before_spawn_with_test_control(
+        &self,
+        deadline: Instant,
+        control: Arc<VerificationControl>,
+    ) -> Result<()> {
+        let verified = VerificationJob::spawn(
+            RuntimePackage::new(self.root.clone(), self.lock.clone()),
+            control,
+            Some(deadline),
+            "runtime.spawn",
+        )?
+        .join_with_deadline(Some(deadline), "runtime.spawn")
+        .await?;
+        if verified.entrypoint != self.entrypoint {
+            return Err(Error::new(
+                ErrorKind::RuntimeVerification,
+                "runtime.spawn",
+                "runtime entrypoint changed after verification",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn remaining_deadline(deadline: Instant, operation: &'static str) -> Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(Error::timeout(operation, Duration::ZERO))
+    } else {
+        Ok(remaining)
+    }
 }
 
 #[derive(Deserialize)]
@@ -170,6 +842,14 @@ fn verify_host_target(target: &str) -> Result<()> {
 }
 
 fn verify_filesystem(package: RuntimePackage) -> Result<VerifiedRuntime> {
+    verify_filesystem_with_control(package, &VerificationControl::new())
+}
+
+fn verify_filesystem_with_control(
+    package: RuntimePackage,
+    control: &VerificationControl,
+) -> Result<VerifiedRuntime> {
+    control.checkpoint("runtime.verify")?;
     let root_metadata = fs::symlink_metadata(&package.root).map_err(|error| {
         Error::new(
             ErrorKind::RuntimeVerification,
@@ -199,9 +879,10 @@ fn verify_filesystem(package: RuntimePackage) -> Result<VerifiedRuntime> {
         ));
     }
     verify_secure_permissions(&root, false)?;
-    verify_exact_file_set(&root, &package.lock.artifacts)?;
+    verify_exact_file_set(&root, &package.lock.artifacts, control)?;
 
     for artifact in &package.lock.artifacts {
+        control.checkpoint("runtime.artifact")?;
         let joined = root.join(&artifact.relative_path);
         let metadata = fs::symlink_metadata(&joined).map_err(|error| {
             Error::new(
@@ -241,7 +922,7 @@ fn verify_filesystem(package: RuntimePackage) -> Result<VerifiedRuntime> {
             ));
         }
         verify_secure_permissions(&canonical, artifact.executable)?;
-        let actual = hash_file(&canonical)?;
+        let actual = hash_file_with_control(&canonical, artifact.max_bytes, control)?;
         if actual != artifact.sha256 {
             return Err(Error::new(
                 ErrorKind::RuntimeVerification,
@@ -255,6 +936,7 @@ fn verify_filesystem(package: RuntimePackage) -> Result<VerifiedRuntime> {
         }
     }
 
+    control.checkpoint("runtime.manifest")?;
     let manifest_path = root.join("codex-package.json");
     let manifest: PackageManifest =
         serde_json::from_reader(File::open(&manifest_path).map_err(|error| {
@@ -298,10 +980,15 @@ fn verify_filesystem(package: RuntimePackage) -> Result<VerifiedRuntime> {
     Ok(VerifiedRuntime {
         entrypoint: root.join(&package.lock.entrypoint),
         root,
+        lock: package.lock,
     })
 }
 
-fn verify_exact_file_set(root: &Path, artifacts: &[RuntimeArtifact]) -> Result<()> {
+fn verify_exact_file_set(
+    root: &Path,
+    artifacts: &[RuntimeArtifact],
+    control: &VerificationControl,
+) -> Result<()> {
     let expected_files = artifacts
         .iter()
         .map(|artifact| artifact.relative_path.clone())
@@ -326,6 +1013,7 @@ fn verify_exact_file_set(root: &Path, artifacts: &[RuntimeArtifact]) -> Result<(
     let mut observed_directories = HashSet::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
+        control.checkpoint("runtime.layout")?;
         for entry in fs::read_dir(&directory).map_err(|error| {
             Error::new(
                 ErrorKind::RuntimeVerification,
@@ -333,6 +1021,7 @@ fn verify_exact_file_set(root: &Path, artifacts: &[RuntimeArtifact]) -> Result<(
                 format!("cannot read {}: {error}", directory.display()),
             )
         })? {
+            control.checkpoint("runtime.layout")?;
             let entry = entry.map_err(|error| {
                 Error::new(
                     ErrorKind::RuntimeVerification,
@@ -454,10 +1143,6 @@ fn verify_secure_permissions(_path: &Path, _executable: bool) -> Result<()> {
     Ok(())
 }
 
-async fn verify_version(entrypoint: &Path, version: &str) -> Result<()> {
-    verify_version_with_timeout(entrypoint, version, VERSION_TIMEOUT).await
-}
-
 async fn verify_version_with_timeout(
     entrypoint: &Path,
     version: &str,
@@ -507,8 +1192,29 @@ async fn verify_version_with_timeout_supported(
     };
 
     let mut command = process_tree::command(&guardian_path, entrypoint);
+    let bundled_path = entrypoint
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join("codex-path"))
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::RuntimeVerification,
+                "runtime.version",
+                "runtime entrypoint has no canonical package root",
+            )
+        })?;
+    let path = env::join_paths([bundled_path]).map_err(|error| {
+        Error::new(
+            ErrorKind::RuntimeVerification,
+            "runtime.version",
+            format!("cannot construct version probe PATH: {error}"),
+        )
+    })?;
     command
         .arg("--version")
+        .env_clear()
+        .env("PATH", path)
+        .current_dir(std::env::temp_dir())
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())
@@ -842,7 +1548,37 @@ fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> serde_json::Resu
     Ok(())
 }
 
+#[cfg(test)]
 fn hash_file(path: &Path) -> Result<String> {
+    hash_file_with_control(path, u64::MAX, &VerificationControl::new())
+}
+
+fn hash_file_with_control(
+    path: &Path,
+    max_bytes: u64,
+    control: &VerificationControl,
+) -> Result<String> {
+    control.checkpoint("runtime.hash")?;
+    let expected_metadata = fs::symlink_metadata(path).map_err(|error| {
+        Error::new(
+            ErrorKind::RuntimeVerification,
+            "runtime.hash",
+            format!("cannot inspect {}: {error}", path.display()),
+        )
+    })?;
+    let expected_size = expected_metadata.len();
+    if expected_size > max_bytes {
+        return Err(Error::new(
+            ErrorKind::RuntimeVerification,
+            "runtime.size",
+            format!(
+                "{} is {} bytes, exceeding the locked {} byte ceiling",
+                path.display(),
+                expected_size,
+                max_bytes
+            ),
+        ));
+    }
     let mut file = File::open(path).map_err(|error| {
         Error::new(
             ErrorKind::RuntimeVerification,
@@ -851,8 +1587,10 @@ fn hash_file(path: &Path) -> Result<String> {
         )
     })?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 128 * 1024];
+    let mut buffer = [0_u8; VERIFICATION_READ_CHUNK_BYTES];
+    let mut total = 0_u64;
     loop {
+        control.checkpoint("runtime.hash")?;
         let count = file.read(&mut buffer).map_err(|error| {
             Error::new(
                 ErrorKind::RuntimeVerification,
@@ -863,7 +1601,37 @@ fn hash_file(path: &Path) -> Result<String> {
         if count == 0 {
             break;
         }
+        total = total.checked_add(count as u64).ok_or_else(|| {
+            Error::new(
+                ErrorKind::RuntimeVerification,
+                "runtime.size",
+                format!("{} size counter overflowed", path.display()),
+            )
+        })?;
+        if total > max_bytes {
+            return Err(Error::new(
+                ErrorKind::RuntimeVerification,
+                "runtime.size",
+                format!(
+                    "{} exceeded the locked {} byte ceiling while hashing",
+                    path.display(),
+                    max_bytes
+                ),
+            ));
+        }
         hasher.update(&buffer[..count]);
+    }
+    if total != expected_size {
+        return Err(Error::new(
+            ErrorKind::RuntimeVerification,
+            "runtime.size",
+            format!(
+                "{} changed size during hashing: expected {}, observed {}",
+                path.display(),
+                expected_size,
+                total
+            ),
+        ));
     }
     Ok(format_digest(hasher.finalize()))
 }
@@ -901,6 +1669,60 @@ mod tests {
 
         assert_eq!(lock.version(), "0.150.1");
         assert_eq!(schema_hash, lock.protocol_schema_canonical_sha256());
+        let expected = [
+            ("bin/codex", 228_986_048),
+            ("bin/codex-code-mode-host", 57_150_064),
+            ("codex-package.json", 200),
+            ("codex-path/rg", 4_030_432),
+            ("codex-resources/zsh/bin/zsh", 754_208),
+        ];
+        for (path, size) in expected {
+            let artifact = lock
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.relative_path == Path::new(path))
+                .expect("pinned artifact is present");
+            assert_eq!(artifact.max_bytes, size, "{path} ceiling");
+            assert!(artifact.max_bytes >= 1);
+        }
+        assert!(pinned.download().bytes() < lock.artifacts[0].max_bytes);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn installed_pinned_package_matches_observed_lock_sizes_and_hashes() {
+        let root = env::var_os("VERGERAIL_CODEX_PACKAGE")
+            .map(PathBuf::from)
+            .or_else(|| {
+                env::var_os("HOME").map(|home| {
+                    PathBuf::from(home)
+                        .join("Library/Application Support/vergerail/runtimes/codex/0.150.1/aarch64-apple-darwin")
+                })
+            });
+        let Some(root) = root else {
+            eprintln!("skipping installed pinned runtime proof: HOME is not set");
+            return;
+        };
+        if !root.is_dir() {
+            eprintln!(
+                "skipping installed pinned runtime proof: package is not installed at {}",
+                root.display()
+            );
+            return;
+        }
+
+        let package = RuntimePackage::pinned(&root).expect("installed package uses pinned lock");
+        for artifact in &package.lock.artifacts {
+            let path = root.join(&artifact.relative_path);
+            let metadata = fs::symlink_metadata(&path).expect("locked installed artifact");
+            assert_eq!(
+                metadata.len(),
+                artifact.max_bytes,
+                "{} size",
+                path.display()
+            );
+        }
+        verify_filesystem(package).expect("installed pinned package verifies byte-for-byte");
     }
 
     #[test]
@@ -1013,6 +1835,75 @@ mod tests {
                 .expect_err("modified artifact")
                 .kind(),
             ErrorKind::RuntimeVerification
+        );
+    }
+
+    #[test]
+    fn rejects_artifact_that_exceeds_its_locked_byte_ceiling_before_hashing() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut package = create_test_package(directory.path(), TEST_SCRIPT, None);
+        package.lock.artifacts[0].max_bytes = 1;
+
+        let error = verify_filesystem(package).expect_err("oversized artifact");
+        assert_eq!(error.kind(), ErrorKind::RuntimeVerification);
+        assert_eq!(error.operation(), "runtime.size");
+    }
+
+    #[test]
+    fn launch_reverification_rejects_mutation_after_initial_verification() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let package = create_test_package(directory.path(), TEST_SCRIPT, None);
+        let verified = verify_filesystem(package).expect("initial filesystem verification");
+
+        fs::write(verified.root.join("bin/codex"), "mutated").expect("mutate entrypoint");
+        let error = verified
+            .reverify_before_spawn()
+            .expect_err("launch must reverify the locked file set");
+        assert_eq!(error.kind(), ErrorKind::RuntimeVerification);
+        assert_eq!(error.operation(), "runtime.hash");
+    }
+
+    #[tokio::test]
+    async fn launch_reverification_rejects_an_expired_deadline_before_spawn() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let package = create_test_package(directory.path(), TEST_SCRIPT, None);
+        let verified = verify_filesystem(package).expect("initial filesystem verification");
+        let deadline = Instant::now() - Duration::from_millis(1);
+
+        let error = verified
+            .reverify_before_spawn_with_deadline(Some(deadline))
+            .await
+            .expect_err("expired launch deadline must prevent spawn");
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+        assert_eq!(error.operation(), "runtime.spawn");
+    }
+
+    #[tokio::test]
+    async fn started_slow_reverification_cancels_and_joins_before_deadline_error() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let package = create_test_package(directory.path(), TEST_SCRIPT, None);
+        let verified = verify_filesystem(package).expect("initial filesystem verification");
+        let control = VerificationControl::slow_for_test(Duration::from_millis(250));
+        let deadline = Instant::now() + Duration::from_millis(25);
+        let spawn_attempts_before = crate::private::process::test_spawn_attempts();
+
+        let error = verified
+            .reverify_before_spawn_with_test_control(deadline, Arc::clone(&control))
+            .await
+            .expect_err("slow verification must honor its deadline");
+
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+        assert_eq!(error.operation(), "runtime.spawn");
+        assert_eq!(control.started_workers.load(Ordering::Acquire), 1);
+        assert_eq!(control.active_workers.load(Ordering::Acquire), 0);
+        assert_eq!(
+            crate::private::process::test_spawn_attempts(),
+            spawn_attempts_before,
+            "expired revalidation must not attempt process spawn"
+        );
+        assert!(
+            control.cancelled.load(Ordering::Acquire),
+            "deadline must signal the owned verification worker"
         );
     }
 

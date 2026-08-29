@@ -2,14 +2,24 @@
 
 ## 지원 경계
 
-Vergerail runtime 실행은 Apple silicon macOS와 저장소에 고정된 Codex `0.150.1` package를 대상으로 합니다. package manifest, entrypoint, bundled path와 checksum을 실행 전에 검증합니다. Linux build는 runtime을 실행하지 않는 정적 계약 검증만 의미합니다.
+Vergerail runtime 실행은 Apple silicon macOS와 저장소에 고정된 Codex `0.150.1` package를 대상으로 합니다. package manifest, entrypoint, bundled path와 checksum을 실행 전에 검증하고 spawn 직전 전체 locked file-set/hash/permission을 다시 확인합니다. 각 locked artifact에는 설치된 pinned package에서 관찰한 strict byte ceiling이 있으며, hash 전에 크기를 확인하고 chunk hash 중에도 초과를 거부합니다. managed cache는 기존 symlink component를 따라가지 않습니다. Linux build는 runtime을 실행하지 않는 정적 계약 검증만 의미합니다.
+
+이미지 응답의 압축 해제 scanline raw data는 정확히 14 MiB를 넘을 수 없고
+상한은 row allocation 전에 검사됩니다. billed image 요청이 dispatch된 뒤
+caller가 취소하거나 결과를 잃으면 `OutcomeUnknown`으로 connection을 종료하며
+재시도하지 않습니다. explicit HTTP 401만 같은 turn ID로 한 번 재인증합니다.
+`timeoutMs`는 runtime 검증·connect·operation이 공유하는 하나의 monotonic
+deadline입니다. deadline 만료 뒤 shutdown은 별도의 고정 2초 teardown budget으로
+bounded하게 시도하며 이 budget은 `timeoutMs`에 포함되지 않습니다. 최종 재검증과 `exec` 사이 same-UID path replacement
+race는 safe-Rust/path 실행만으로 절대 보장할 수 없는 잔여 범위입니다.
 
 ## 인증
 
 Vergerail은 인증 파일이나 browser cookie/profile을 직접 읽지 않습니다. 일반
-library 사용은 공식 app-server가 관리하는 기본 Codex home을 사용하고, UpAgent
-provider는 재현성을 위해 `VERGERAIL_CODEX_HOME`을 명시적으로 전달합니다. 그
-home은 ChatGPT 앱 또는 `codex login`으로 이미 로그인되어 있어야 합니다.
+library와 UpAgent provider는 공식 app-server가 선택한 Codex account를 사용합니다.
+별도의 Vergerail account 경로는 없고 upstream `CODEX_HOME`이 있으면 그대로
+상속합니다. 선택된 account는 ChatGPT 앱 또는 `codex login`으로 이미 로그인되어
+있어야 합니다.
 
 이미지 요청에서 공식 app-server는 `getAuthStatus`의
 `includeToken=true, refreshToken=true` 결과로 short-lived access token과 JWT의

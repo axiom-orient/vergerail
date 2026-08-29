@@ -192,6 +192,7 @@ impl RuntimeResolver {
         }
 
         let managed_root = cache_root.join(managed_relative_root(&runtime_lock));
+        ensure_no_symlink_components(&cache_root, &managed_root)?;
         match fs::symlink_metadata(&managed_root) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
                 let package = RuntimePackage::new(&managed_root, runtime_lock.clone());
@@ -598,20 +599,99 @@ fn extract_runtime(archive_path: &Path, staging_root: &Path, pinned: &PinnedRunt
 }
 
 fn create_private_directory(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(path).map_err(|error| {
-                install_error(format!("cannot create runtime directory: {error}"))
-            })?;
+    if path
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(install_error(
+            "runtime directory may not contain a parent component",
+        ));
+    }
+    let mut missing = Vec::new();
+    let mut current = path.to_path_buf();
+    let existing = loop {
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => break (current, metadata),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(current.clone());
+                if !current.pop() {
+                    return Err(install_error("runtime directory has no existing parent"));
+                }
+            }
+            Err(error) => {
+                return Err(install_error(format!(
+                    "cannot inspect runtime directory: {error}"
+                )));
+            }
         }
-        Err(error) => {
+    };
+    if existing.1.file_type().is_symlink() || !existing.1.is_dir() {
+        return Err(install_error(format!(
+            "{} must be a real, non-symlink runtime directory",
+            existing.0.display()
+        )));
+    }
+    for directory in missing.into_iter().rev() {
+        match fs::create_dir(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(install_error(format!(
+                    "cannot create runtime directory: {error}"
+                )));
+            }
+        }
+        let metadata = fs::symlink_metadata(&directory).map_err(|error| {
+            install_error(format!("cannot inspect created runtime directory: {error}"))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(install_error(format!(
-                "cannot inspect runtime directory: {error}"
+                "{} became a symlink or non-directory while being created",
+                directory.display()
             )));
         }
+        secure_private_directory(&directory, "runtime.install")?;
     }
     secure_private_directory(path, "runtime.install")
+}
+
+fn ensure_no_symlink_components(root: &Path, path: &Path) -> Result<()> {
+    let mut current = path.to_path_buf();
+    loop {
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(install_error(format!(
+                        "runtime cache component {} is a symbolic link",
+                        current.display()
+                    )));
+                }
+                if !metadata.is_dir() {
+                    return Err(install_error(format!(
+                        "runtime cache component {} is not a directory",
+                        current.display()
+                    )));
+                }
+                if current == root {
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && current == root => {
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(install_error(format!(
+                    "cannot inspect runtime cache component: {error}"
+                )));
+            }
+        }
+        if !current.pop() {
+            return Err(install_error(
+                "runtime cache path escaped its configured root",
+            ));
+        }
+    }
 }
 
 fn secure_private_directory(path: &Path, operation: &'static str) -> Result<()> {
@@ -718,6 +798,15 @@ mod tests {
             .await
             .expect_err("missing runtime must fail");
         assert_eq!(error.operation(), "runtime.resolve");
+    }
+
+    #[test]
+    fn component_check_allows_a_missing_cache_root_before_installation() {
+        let directory = tempfile::tempdir().expect("cache parent");
+        let cache = directory.path().join("missing-cache");
+        let managed = cache.join("codex/0.150.1/aarch64-apple-darwin");
+        ensure_no_symlink_components(&cache, &managed).expect("missing root is installable");
+        assert!(!cache.exists());
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -960,6 +1049,38 @@ mod tests {
                 & 0o777,
             0o755
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_runtime_directory_rejects_symlinked_descendants_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let target = directory.path().join("outside");
+        fs::create_dir(&target).expect("outside target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
+            .expect("target permissions");
+        let cache = directory.path().join("cache");
+        fs::create_dir(&cache).expect("cache");
+        let version = cache.join("codex");
+        fs::create_dir(&version).expect("codex");
+        let link = version.join("0.150.1");
+        symlink(&target, &link).expect("version symlink");
+
+        let error = create_private_directory(&link.join("aarch64-apple-darwin"))
+            .expect_err("symlinked version component must be rejected");
+
+        assert_eq!(error.kind(), ErrorKind::RuntimeVerification);
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("target remains")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(link.is_symlink());
     }
 
     fn append_file(builder: &mut tar::Builder<GzEncoder<File>>, path: &str, contents: &[u8]) {

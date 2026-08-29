@@ -36,7 +36,8 @@ async fn main() -> Result<()> {
         Some(package_root) => host_runtime(PathBuf::from(package_root))?,
         None => RuntimeResolver::new().resolve().await?.into_package(),
     };
-    let codex = Codex::connect(CodexConfig::new(runtime).with_image_generation(true)).await?;
+    let config = CodexConfig::new(runtime).with_image_generation(true);
+    let codex = Codex::connect(config).await?;
 
     let verification = verify_live_account(
         &codex,

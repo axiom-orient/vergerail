@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
 const DIAGNOSTIC_CAPACITY: usize = 128;
+const DIAGNOSTIC_ITEM_BYTES: usize = 8 * 1024;
+const DIAGNOSTIC_TOTAL_BYTES: usize = 1024 * 1024;
 
 /// Terminal status reported by Codex for a turn.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,12 +183,14 @@ pub struct Diagnostic {
 /// Thread-safe bounded ownership for diagnostics outside a specific run.
 pub(crate) struct DiagnosticBuffer {
     items: Mutex<VecDeque<Diagnostic>>,
+    bytes: Mutex<usize>,
 }
 
 impl DiagnosticBuffer {
     pub(crate) fn new() -> Self {
         Self {
             items: Mutex::new(VecDeque::new()),
+            bytes: Mutex::new(0),
         }
     }
 
@@ -197,31 +201,93 @@ impl DiagnosticBuffer {
     }
 
     pub(crate) fn take(&self) -> Vec<Diagnostic> {
-        self.items().drain(..).collect()
+        let items = self.items().drain(..).collect();
+        *self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = 0;
+        items
     }
 
     pub(crate) fn push(&self, diagnostic: Diagnostic) {
+        let diagnostic = bound_diagnostic(diagnostic);
         let mut items = self.items();
-        if items.len() >= DIAGNOSTIC_CAPACITY {
-            while items.len() > DIAGNOSTIC_CAPACITY.saturating_sub(2) {
-                items.pop_front();
-            }
-            if !items
-                .iter()
-                .any(|item| item.method == "vergerail/diagnosticsOverflow")
+        let mut bytes = self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let diagnostic_size = diagnostic_bytes(&diagnostic);
+        let overflow = Diagnostic {
+            method: "vergerail/diagnosticsOverflow".to_owned(),
+            message:
+                "older diagnostics were discarded after reaching a bounded count or byte limit"
+                    .to_owned(),
+        };
+        let overflow_bytes = diagnostic_bytes(&overflow);
+        if items.len() >= DIAGNOSTIC_CAPACITY
+            || bytes.saturating_add(diagnostic_size) > DIAGNOSTIC_TOTAL_BYTES
+        {
+            while (items.len() >= DIAGNOSTIC_CAPACITY.saturating_sub(1)
+                || bytes
+                    .saturating_add(diagnostic_size)
+                    .saturating_add(if has_overflow(&items) {
+                        0
+                    } else {
+                        overflow_bytes
+                    })
+                    > DIAGNOSTIC_TOTAL_BYTES)
+                && !items.is_empty()
             {
-                items.push_back(Diagnostic {
-                    method: "vergerail/diagnosticsOverflow".to_owned(),
-                    message: "older diagnostics were discarded after reaching the bounded capacity"
-                        .to_owned(),
-                });
+                if let Some(removed) = items.pop_front() {
+                    *bytes = bytes.saturating_sub(diagnostic_bytes(&removed));
+                }
+            }
+            if !has_overflow(&items) && items.len() < DIAGNOSTIC_CAPACITY {
+                *bytes = bytes.saturating_add(overflow_bytes);
+                items.push_back(overflow);
             }
         }
-        while items.len() >= DIAGNOSTIC_CAPACITY {
-            items.pop_front();
+        while (items.len() >= DIAGNOSTIC_CAPACITY
+            || bytes.saturating_add(diagnostic_size) > DIAGNOSTIC_TOTAL_BYTES)
+            && !items.is_empty()
+        {
+            if let Some(removed) = items.pop_front() {
+                *bytes = bytes.saturating_sub(diagnostic_bytes(&removed));
+            }
         }
+        *bytes = bytes.saturating_add(diagnostic_size);
         items.push_back(diagnostic);
     }
+}
+
+fn diagnostic_bytes(diagnostic: &Diagnostic) -> usize {
+    diagnostic
+        .method
+        .len()
+        .saturating_add(diagnostic.message.len())
+}
+
+fn has_overflow(items: &VecDeque<Diagnostic>) -> bool {
+    items
+        .iter()
+        .any(|item| item.method == "vergerail/diagnosticsOverflow")
+}
+
+fn bound_diagnostic(mut diagnostic: Diagnostic) -> Diagnostic {
+    let mut method_limit = diagnostic.method.len().min(DIAGNOSTIC_ITEM_BYTES);
+    while method_limit > 0 && !diagnostic.method.is_char_boundary(method_limit) {
+        method_limit -= 1;
+    }
+    diagnostic.method.truncate(method_limit);
+    let message_limit = DIAGNOSTIC_ITEM_BYTES.saturating_sub(diagnostic.method.len());
+    if diagnostic.message.len() > message_limit {
+        let mut end = message_limit;
+        while end > 0 && !diagnostic.message.is_char_boundary(end) {
+            end -= 1;
+        }
+        diagnostic.message.truncate(end);
+    }
+    diagnostic
 }
 
 /// One event from a running Codex turn.
@@ -256,7 +322,10 @@ pub enum Event {
 
 #[cfg(test)]
 mod diagnostic_buffer_tests {
-    use super::{DIAGNOSTIC_CAPACITY, Diagnostic, DiagnosticBuffer};
+    use super::{
+        DIAGNOSTIC_CAPACITY, DIAGNOSTIC_ITEM_BYTES, DIAGNOSTIC_TOTAL_BYTES, Diagnostic,
+        DiagnosticBuffer, diagnostic_bytes,
+    };
 
     #[test]
     fn overflow_is_bounded_and_reported_once() {
@@ -282,5 +351,58 @@ mod diagnostic_buffer_tests {
             Some("method-128")
         );
         assert!(buffer.take().is_empty());
+    }
+
+    #[test]
+    fn item_limit_truncates_method_and_message_at_utf8_boundaries() {
+        let buffer = DiagnosticBuffer::new();
+        buffer.push(Diagnostic {
+            method: "진단".repeat(DIAGNOSTIC_ITEM_BYTES),
+            message: "메시지".repeat(DIAGNOSTIC_ITEM_BYTES),
+        });
+
+        let diagnostics = buffer.take();
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics[0];
+        assert!(diagnostic.method.is_char_boundary(diagnostic.method.len()));
+        assert!(
+            diagnostic
+                .message
+                .is_char_boundary(diagnostic.message.len())
+        );
+        assert!(diagnostic_bytes(diagnostic) <= DIAGNOSTIC_ITEM_BYTES);
+    }
+
+    #[test]
+    fn aggregate_limit_keeps_byte_accounting_bounded_and_resets_on_take() {
+        let buffer = DiagnosticBuffer::new();
+        let message = "x".repeat(DIAGNOSTIC_ITEM_BYTES);
+        for index in 0..DIAGNOSTIC_CAPACITY {
+            buffer.push(Diagnostic {
+                method: format!("method-{index}"),
+                message: message.clone(),
+            });
+        }
+        buffer.push(Diagnostic {
+            method: "after-limit".to_owned(),
+            message: "new".to_owned(),
+        });
+
+        let diagnostics = buffer.take();
+        assert!(diagnostics.len() <= DIAGNOSTIC_CAPACITY);
+        assert!(diagnostics.iter().map(diagnostic_bytes).sum::<usize>() <= DIAGNOSTIC_TOTAL_BYTES);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|item| item.method == "vergerail/diagnosticsOverflow")
+                .count(),
+            1
+        );
+
+        buffer.push(Diagnostic {
+            method: "after-reset".to_owned(),
+            message: "ok".to_owned(),
+        });
+        assert_eq!(buffer.take().len(), 1);
     }
 }

@@ -15,27 +15,32 @@
     {
       "path": "bin/codex",
       "sha256": "a14f9a907c12c8812878b70e6b7d65f81c39ed795513e46a55817d7428c0ca6b",
-      "executable": true
+      "executable": true,
+      "max_bytes": 228986048
     },
     {
       "path": "bin/codex-code-mode-host",
       "sha256": "b9333d84d974ad34e8263d3f0fd5282e96f6a85a79f76d7456327921a04b5459",
-      "executable": true
+      "executable": true,
+      "max_bytes": 57150064
     },
     {
       "path": "codex-package.json",
       "sha256": "f1fb8f28a73bd100038949292c642b1db871b4753fe21dc8e2aef92d4f792eaf",
-      "executable": false
+      "executable": false,
+      "max_bytes": 200
     },
     {
       "path": "codex-path/rg",
       "sha256": "5d24e1af7efa7811e03df5555eeaa984bc8bd98ab42a5d49ecf30f163273e6c7",
-      "executable": true
+      "executable": true,
+      "max_bytes": 4030432
     },
     {
       "path": "codex-resources/zsh/bin/zsh",
       "sha256": "6eab971b2ef4a2e5e9d86a6fbd779c18f93fa6ae1f2c016b896324255034decf",
-      "executable": true
+      "executable": true,
+      "max_bytes": 754208
     }
   ]
 }

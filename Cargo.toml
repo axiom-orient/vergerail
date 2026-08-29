@@ -18,6 +18,7 @@ include = [
     "src/**/*.rs",
     "src/native/**",
     "tests/*.rs",
+    "tests/fixtures/**",
     "examples/**",
     "protocol/**",
     "runtime/**",

@@ -24,6 +24,8 @@ pub enum ErrorKind {
     Timeout,
     /// The process or transport disconnected.
     Disconnected,
+    /// The caller cancelled the operation before an external effect began.
+    Cancelled,
     /// A non-idempotent request was written, but its outcome could not be observed.
     OutcomeUnknown,
     /// The consumer did not drain a bounded event stream fast enough.
