@@ -20,8 +20,8 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::time::timeout;
 use vergerail::{
-    Codex, CodexConfig, DirectImageRequest, ImageBackground, ImageQuality, ImageSize,
-    ReasoningEffort, RuntimePackage, SessionOptions, TurnStatus,
+    Codex, CodexConfig, DirectImageRequest, Event, ImageBackground, ImageQuality, ImageSize,
+    ReasoningEffort, Run, RunResult, RuntimePackage, SessionOptions, TurnStatus,
 };
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -877,16 +877,11 @@ async fn async_run_request(
                     false,
                 )),
             },
-            ProviderOperation::ImageGenerate => {
-                match timeout(operation_timeout, run_image_generation(&codex, &request)).await {
-                    Ok(result) => result,
-                    Err(_) => Err(failure(
-                        "resolution_required",
-                        "billed image operation exceeded timeoutMs; resolve the outcome before retrying",
-                        false,
-                    )),
-                }
-            }
+            // `Codex::generate_image` owns the dispatch state and receives this
+            // absolute deadline through `CodexConfig`.  Do not wrap it in a
+            // second timeout: dropping that future would erase whether the
+            // image request was still pending or had reached the billed endpoint.
+            ProviderOperation::ImageGenerate => run_image_generation(&codex, &request).await,
         },
     };
     let shutdown = match remaining_provider_timeout(deadline) {
@@ -985,13 +980,11 @@ async fn run_model_turn(
         .await
         .map_err(|error| classify_vergerail_error(&error.to_string(), error.kind()))?;
     let verification = async {
-        let result = session
+        let run = session
             .start(rendered.prompt)
             .await
-            .map_err(|error| classify_vergerail_error(&error.to_string(), error.kind()))?
-            .wait()
-            .await
             .map_err(|error| classify_vergerail_error(&error.to_string(), error.kind()))?;
+        let result = wait_for_text_only_run(run).await?;
         if result.status != TurnStatus::Completed || !result.image_generations.is_empty() {
             return Err(failure(
                 "provider_failed",
@@ -1083,6 +1076,66 @@ async fn run_model_turn(
             false,
         )),
     }
+}
+
+async fn wait_for_text_only_run(mut run: Run) -> ProviderResult<RunResult> {
+    let mut live_violation = None;
+    while let Some(event) = run.next_event().await {
+        match event.map_err(|error| classify_vergerail_error(&error.to_string(), error.kind()))? {
+            Event::Started | Event::TextDelta(_) | Event::UsageUpdated(_) => {}
+            Event::ApprovalRequested(request) => {
+                request
+                    .deny()
+                    .await
+                    .map_err(|error| classify_vergerail_error(&error.to_string(), error.kind()))?;
+                live_violation.get_or_insert("approval request");
+            }
+            Event::Command(_) | Event::CommandOutput(_) => {
+                live_violation.get_or_insert("command execution");
+            }
+            Event::FileChange(_) => {
+                live_violation.get_or_insert("file change");
+            }
+            Event::ImageGeneration(_) => {
+                live_violation.get_or_insert("image generation");
+            }
+            Event::Warning(_) => {
+                live_violation.get_or_insert("runtime warning");
+            }
+            Event::Unknown(event) if is_allowed_text_only_lifecycle(&event.method) => {}
+            Event::Unknown(_) => {
+                live_violation.get_or_insert("unsupported runtime event");
+            }
+            Event::Completed(result) => {
+                if let Some(violation) = live_violation {
+                    return Err(failure(
+                        "provider_failed",
+                        &format!("text-only model turn observed forbidden live {violation}"),
+                        false,
+                    ));
+                }
+                return Ok(result);
+            }
+            Event::Failed(error) => {
+                return Err(classify_vergerail_error(&error.to_string(), error.kind()));
+            }
+            _ => {
+                live_violation.get_or_insert("unsupported runtime event");
+            }
+        }
+    }
+    Err(failure(
+        "resolution_required",
+        "text-only model turn disconnected before a terminal result",
+        false,
+    ))
+}
+
+fn is_allowed_text_only_lifecycle(method: &str) -> bool {
+    matches!(
+        method,
+        "thread/status/changed" | "item/started" | "item/completed" | "turn/diff/updated"
+    )
 }
 
 fn remaining_provider_timeout(deadline: Instant) -> ProviderResult<Duration> {
@@ -2665,5 +2718,21 @@ mod tests {
     #[test]
     fn protocol_schema_is_versioned() {
         assert_eq!(PROTOCOL_VERSION, 1);
+    }
+
+    #[test]
+    fn text_only_lifecycle_allows_only_known_non_effect_notifications() {
+        for method in [
+            "thread/status/changed",
+            "item/started",
+            "item/completed",
+            "turn/diff/updated",
+        ] {
+            assert!(is_allowed_text_only_lifecycle(method), "{method}");
+        }
+        assert!(!is_allowed_text_only_lifecycle(
+            "item/commandExecution/started"
+        ));
+        assert!(!is_allowed_text_only_lifecycle("unknown/additive"));
     }
 }
