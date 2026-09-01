@@ -17,10 +17,15 @@ use tempfile::tempdir;
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use vergerail::{
     Account, ApprovalEvent, Codex, CodexConfig, CommandDecision, Event, FileChangeDecision,
-    ReasoningEffort, RuntimePackage, RuntimeResolver, SessionOptions, TurnAudit, TurnStatus,
+    ReasoningEffort, RuntimePackage, RuntimeResolver, SessionOptions, TurnAudit, TurnInput,
+    TurnStatus,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn StdError>>;
+
+fn text_input(value: impl Into<String>) -> Vec<TurnInput> {
+    vec![TurnInput::text(value)]
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -105,7 +110,7 @@ async fn verify_live_account(
 
     let one_shot = codex
         .run(
-            "Reply with exactly VERGERAIL_LIVE_ONE_SHOT_OK.",
+            text_input("Reply with exactly VERGERAIL_LIVE_ONE_SHOT_OK."),
             SessionOptions::read_only(workspace).with_model(&model),
         )
         .await?;
@@ -118,9 +123,9 @@ async fn verify_live_account(
     let thread_id = session.id().to_owned();
     let first_turn = wait_with_live_diagnostics(
         session
-            .start(format!(
+            .start(text_input(format!(
                 "Remember the token `{resume_nonce}` for the next turn. Reply with exactly VERGERAIL_LIVE_SESSION_OK."
-            ))
+            )))
             .await?,
         "session",
     )
@@ -136,9 +141,9 @@ async fn verify_live_account(
         .await?;
     let resumed_turn = wait_with_live_diagnostics(
         resumed
-            .start(
+            .start(text_input(
                 "Reply with exactly the token I asked you to remember in the previous turn, and nothing else.",
-            )
+            ))
             .await?,
         "resumed-session",
     )
@@ -189,9 +194,9 @@ async fn verify_image_generation(
         .await?;
     let verification: Result<(String, u64, u64, u64, u64, u64, u64)> = async {
         let mut run = session
-            .start(
+            .start(text_input(
                 "Generate exactly one square PNG image: a centered bright green circle on a solid dark navy background. Do not write files or call any tool other than image generation.",
-            )
+            ))
             .await?;
         let mut completed = None;
         while let Some(event) = run.next_event().await {
@@ -767,7 +772,9 @@ async fn verify_interruption(codex: &Codex, workspace: &Path, model: &str) -> Re
         .session(SessionOptions::read_only(workspace).with_model(model))
         .await?;
     let mut run = session
-        .start("Wait for 30 seconds before replying with VERGERAIL_INTERRUPT_TOO_LATE.")
+        .start(text_input(
+            "Wait for 30 seconds before replying with VERGERAIL_INTERRUPT_TOO_LATE.",
+        ))
         .await?;
     loop {
         match run
@@ -1164,7 +1171,7 @@ async fn run_audited_turn(
 ) -> Result<TurnObservation> {
     require_no_diagnostics(codex, "before audited turn").await?;
     let session = codex.session(options).await?;
-    let mut run = session.start(prompt).await?;
+    let mut run = session.start(text_input(prompt)).await?;
     let mut observation = TurnObservation::default();
     let mut completed_turn_id = None;
 

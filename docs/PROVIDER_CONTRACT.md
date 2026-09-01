@@ -16,11 +16,15 @@ are explicit environment configuration:
 * `VERGERAIL_MODEL`
 * `VERGERAIL_WORKSPACE`
 
+This document covers only the UpAgent provider. `ifsc_text_provider` is a separate
+IFSC `ScreenProgram` provider with its own `schemaVersion: 1` input and output
+contract; that independent contract is documented in [IFSC_TEXT_PROVIDER.md](IFSC_TEXT_PROVIDER.md).
+
 `VERGERAIL_CODEX_LOCK` and `VERGERAIL_CODEX_LOCK_SHA256` are not accepted. The
 runtime identity is the embedded official lock; custom app-server builds and
 patches are outside this contract.
 
-The input schema is `vergerail.upagent/1` (`schemaVersion: 1`). A `model_turn`
+The input schema is the canonical `vergerail.upagent/2` (`schemaVersion: 2`). A `model_turn`
 request contains provider-neutral messages, strict object tools, reasoning,
 `timeoutMs`, and `maximumResponseBytes`. An `image_generate` request contains a
 bounded prompt, reasoning, timeoutMs, and maximumResponseBytes. It may also
@@ -33,10 +37,35 @@ is never used as a control fallback. Unknown fields, duplicate tools, non-object
 tool arguments, empty identifiers, oversized frames, and invalid deadlines are
 rejected.
 
+The library exposes the same multimodal shape through `TurnInput`. Callers pass
+an ordered `Vec<TurnInput>` to `Session::start` or `Codex::run`; `Text` and
+`LocalImage { path, detail }` retain their order and become the native `text` and
+`localImage` inputs of `turn/start`. The library validates that text is bounded
+and that each image path is an absolute readable regular file before the request
+crosses the app-server boundary.
+
+`model_turn` may include an `observations` array only when a message contains a
+matching `image_observation` content part. Each observation carries its message
+and part location, PNG media type, lower-case SHA-256, dimensions, and standard
+base64 bytes. Multimodal requests also carry `stagingRoot`, an exact 0700
+request directory created by the UpAgent parent under the system temporary
+directory. The provider accepts only that lexical root shape and never removes
+an arbitrary shared path. It validates the decoded length, digest, complete
+PNG chunk/CRC/zlib structure and dimensions, relative artifact location,
+duplicate locations, a maximum of 16 images, an 8 MiB per-image bound, and a
+32 MiB aggregate bound before creating a Codex session. Validated bytes are
+written to that root as 0600 files and passed to the native typed `localImage`
+turn input; the prompt contains only ordered observation indexes and never a
+staged path or base64. The provider removes staging after session close on
+success and failure; the UpAgent removes the exact root after the provider
+process is reaped on cancellation, timeout, write, wait, or output-drain
+failure. Cleanup errors are returned with the operation failure rather than
+hidden.
+
 Reasoning is a clean six-value wire enum: `off`, `low`, `medium`, `high`,
 `xhigh`, or `max`; omission is invalid. Values map directly to Vergerail's
 native model-turn effort; there is no alias or downgrade. `image_generate`
-keeps the field for `vergerail.upagent/1` envelope compatibility but bypasses
+keeps the field for the `vergerail.upagent/2` envelope but bypasses
 the model entirely, so model and reasoning do not influence image generation.
 Model decoded text and image decoded bytes each have an 8 MiB caller cap. Model
 JSON uses a 64 MiB encoded frame/retained-output cap to safely contain
@@ -133,8 +162,10 @@ replaces or hides the original operation failure.
 Use the official pinned `0.150.1` package. No app-server source build, patch,
 custom executable, or second runtime lock is part of this provider contract.
 The provider receives the pinned package, model, and workspace explicitly. The
-app-server resolves the Codex-selected account. The optional upstream
-`CODEX_HOME` remains Codex configuration and is not a Vergerail provider input:
+app-server resolves the Codex-selected account. `CODEX_HOME` is not a
+`VERGERAIL_*` provider-specific setting; it is upstream Codex configuration
+inherited by the app-server. On the UpAgent path, the agent-owned home value is
+explicitly mapped to `CODEX_HOME` before Vergerail launches:
 
 ```bash
 export VERGERAIL_CODEX_PACKAGE="/absolute/path/to/official-codex-package"

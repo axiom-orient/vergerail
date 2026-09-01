@@ -23,7 +23,7 @@ use crate::private::wire;
 use crate::session::{
     DeferredRunNotification, InterruptCompletionGuard, PreStartFailureTransition, ReplayTransition,
     RunChannels, RunControl, RunRegistry, Sandbox, Session, SessionOptions, SessionRegistry,
-    StartTurnTransition,
+    StartTurnTransition, TurnInput,
 };
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
@@ -337,11 +337,7 @@ impl Codex {
     ///
     /// Interactive approvals are fail-closed. Workspace-write sessions must use
     /// [`Codex::session`] and consume the returned run events explicitly.
-    pub async fn run(
-        &self,
-        prompt: impl Into<String>,
-        options: SessionOptions,
-    ) -> Result<RunResult> {
+    pub async fn run(&self, inputs: Vec<TurnInput>, options: SessionOptions) -> Result<RunResult> {
         if options.sandbox() != Sandbox::ReadOnly {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
@@ -352,7 +348,7 @@ impl Codex {
         let session = self.inner.create_session(options.ephemeral()).await?;
         let mut cleanup =
             EphemeralSessionCleanupGuard::new(Arc::clone(&self.inner), session.id().to_owned());
-        let run = session.start(prompt).await;
+        let run = session.start(inputs).await;
         let result = match run {
             Ok(run) => run.wait().await,
             Err(error) => Err(error),
@@ -1125,7 +1121,7 @@ impl ClientInner {
         cwd: &PathBuf,
         sandbox: Sandbox,
         reasoning: crate::session::ReasoningEffort,
-        prompt: String,
+        inputs: Vec<TurnInput>,
         output_schema: Option<Value>,
     ) -> Result<String> {
         let sandbox_policy = match sandbox {
@@ -1141,9 +1137,13 @@ impl ClientInner {
                 "excludeSlashTmp": true
             }),
         };
+        let native_inputs = inputs
+            .iter()
+            .map(TurnInput::to_native_value)
+            .collect::<Vec<_>>();
         let mut params = json!({
             "threadId": thread_id,
-            "input": [{"type": "text", "text": prompt, "text_elements": []}],
+            "input": native_inputs,
             "cwd": cwd,
             "effort": reasoning.value(),
             "approvalPolicy": sandbox.approval_policy(),

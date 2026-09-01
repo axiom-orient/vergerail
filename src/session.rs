@@ -14,6 +14,7 @@ use crate::event::{Event, RunResult, TurnAudit};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fmt;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -110,6 +111,136 @@ pub enum ReasoningEffort {
     XHigh,
     /// Use the maximum reasoning effort supported by the selected model.
     Max,
+}
+
+/// Detail requested for a local image turn input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageDetail {
+    /// Let Codex choose the image detail.
+    Auto,
+    /// Request low image detail.
+    Low,
+    /// Request high image detail.
+    High,
+    /// Preserve the original image detail.
+    Original,
+}
+
+impl ImageDetail {
+    pub(crate) const fn value(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Low => "low",
+            Self::High => "high",
+            Self::Original => "original",
+        }
+    }
+}
+
+/// One typed user input sent to the native `turn/start` protocol.
+///
+/// Text and local-image inputs retain their ordering in the native request.
+/// Local-image paths are validated as absolute, readable regular files before
+/// the request crosses the app-server boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TurnInput {
+    /// Plain user text.
+    Text(String),
+    /// A local image path owned by the caller.
+    LocalImage {
+        /// Absolute, readable regular image file path.
+        path: PathBuf,
+        /// Optional native image detail hint.
+        detail: Option<ImageDetail>,
+    },
+}
+
+impl TurnInput {
+    /// Creates a text input.
+    #[must_use]
+    pub fn text(value: impl Into<String>) -> Self {
+        Self::Text(value.into())
+    }
+
+    /// Creates a local-image input with an optional native detail hint.
+    #[must_use]
+    pub fn local_image(path: impl Into<PathBuf>, detail: Option<ImageDetail>) -> Self {
+        Self::LocalImage {
+            path: path.into(),
+            detail,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Text(text) => {
+                if text.trim().is_empty() || text.len() > 8 * 1024 * 1024 || text.contains('\0') {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "Session::start",
+                        "text input must be a bounded non-empty UTF-8 value",
+                    ));
+                }
+            }
+            Self::LocalImage { path, .. } => {
+                if !path.is_absolute()
+                    || path.as_os_str().is_empty()
+                    || path.to_string_lossy().contains('\0')
+                    || path
+                        .components()
+                        .any(|component| component == std::path::Component::ParentDir)
+                {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "Session::start",
+                        "local image path must be absolute and free of parent traversal",
+                    ));
+                }
+                let metadata = std::fs::metadata(path).map_err(|error| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        "Session::start",
+                        format!("local image path is not readable: {error}"),
+                    )
+                })?;
+                if !metadata.is_file() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "Session::start",
+                        "local image path must name a regular file",
+                    ));
+                }
+                File::open(path).map_err(|error| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        "Session::start",
+                        format!("local image path is not readable: {error}"),
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn to_native_value(&self) -> Value {
+        match self {
+            Self::Text(text) => serde_json::json!({
+                "type": "text",
+                "text": text,
+                "text_elements": []
+            }),
+            Self::LocalImage { path, detail } => {
+                let mut value = serde_json::json!({
+                    "type": "localImage",
+                    "path": path,
+                });
+                if let Some(detail) = detail {
+                    value["detail"] = Value::String(detail.value().to_owned());
+                }
+                value
+            }
+        }
+    }
 }
 
 impl ReasoningEffort {
@@ -530,15 +661,18 @@ impl Session {
         self.inner.audit_turn(&self.thread_id, turn_id).await
     }
 
-    /// Starts one turn. A session rejects concurrent turns.
-    pub async fn start(&self, prompt: impl Into<String>) -> Result<Run> {
-        let prompt = prompt.into();
-        if prompt.trim().is_empty() {
+    /// Starts one turn from an ordered, non-empty batch of typed inputs.
+    /// A session rejects concurrent turns.
+    pub async fn start(&self, inputs: Vec<TurnInput>) -> Result<Run> {
+        if inputs.is_empty() {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "Session::start",
-                "prompt must be non-empty",
+                "turn input batch must be non-empty",
             ));
+        }
+        for input in &inputs {
+            input.validate()?;
         }
         let lifecycle = self.lifecycle.lock().await;
         if *lifecycle != SessionLifecycle::Open {
@@ -583,7 +717,7 @@ impl Session {
                 &self.cwd,
                 self.sandbox,
                 self.reasoning,
-                prompt,
+                inputs,
                 self.output_schema.clone(),
             )
             .await?;
@@ -778,9 +912,10 @@ impl Drop for Run {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionOptions, SessionRegistry};
+    use super::{ImageDetail, SessionOptions, SessionRegistry, TurnInput};
     use crate::ErrorKind;
     use serde_json::json;
+    use std::fs;
     use std::time::Duration;
 
     #[test]
@@ -838,5 +973,30 @@ mod tests {
             .text_only()
             .validate()
             .expect("bounded object schema is valid in text-only mode");
+    }
+
+    #[test]
+    fn typed_turn_inputs_validate_and_preserve_native_order() {
+        assert!(TurnInput::text("hello").validate().is_ok());
+        assert!(TurnInput::text(" ").validate().is_err());
+        assert!(
+            TurnInput::local_image("relative.png", None)
+                .validate()
+                .is_err()
+        );
+
+        let directory = tempfile::tempdir().expect("temporary image directory");
+        let path = directory.path().join("image.png");
+        fs::write(&path, b"png fixture").expect("fixture");
+        let image = TurnInput::local_image(&path, Some(ImageDetail::High));
+        image.validate().expect("absolute readable image path");
+        assert_eq!(
+            image.to_native_value(),
+            json!({
+                "type": "localImage",
+                "path": path,
+                "detail": "high"
+            })
+        );
     }
 }

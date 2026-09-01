@@ -1038,6 +1038,16 @@ fn validate_png(bytes: &[u8]) -> Result<PngInfo, crate::error::Error> {
     })
 }
 
+/// Validates a bounded PNG payload and returns its declared raster dimensions.
+///
+/// This is shared by the official image adapter and the UpAgent provider so
+/// both ingress paths enforce the same chunk, CRC, zlib, and decompressed
+/// scanline invariants before accepting image bytes.
+pub fn validate_png_dimensions(bytes: &[u8]) -> crate::Result<(u32, u32)> {
+    let info = validate_png(bytes)?;
+    Ok((info.width, info.height))
+}
+
 fn png_channels(color_type: u8) -> usize {
     match color_type {
         0 | 3 => 1,

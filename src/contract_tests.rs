@@ -6,7 +6,7 @@ use crate::runtime::{RuntimeArtifact, RuntimeLock, RuntimePackage};
 use crate::{
     Account, ApprovalEvent, Codex, CodexConfig, CommandDecision, DirectImageRequest, Event,
     ImageBackground, ImageQuality, ImageSize, LoginMethod, ReasoningEffort, SessionOptions,
-    TurnStatus,
+    TurnInput, TurnStatus,
 };
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
@@ -19,6 +19,10 @@ use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
+
+fn text_input(value: impl Into<String>) -> Vec<TurnInput> {
+    vec![TurnInput::text(value)]
+}
 
 const SCRIPT: &str = r###"#!/usr/bin/env python3
 import json
@@ -710,7 +714,10 @@ async fn complete_contract_uses_real_process_and_bidirectional_rpc() {
         .session(SessionOptions::read_only(project_directory.path()).ephemeral())
         .await
         .expect("session");
-    let mut run = session.start("Reply with OK").await.expect("run");
+    let mut run = session
+        .start(text_input("Reply with OK"))
+        .await
+        .expect("run");
     let mut saw_started = false;
     let mut saw_delta = false;
     let result = loop {
@@ -831,7 +838,7 @@ async fn native_output_schema_and_extended_reasoning_reach_turn_start() {
     for effort in [ReasoningEffort::XHigh, ReasoningEffort::Max] {
         let result = codex
             .run(
-                "return structured output",
+                text_input("return structured output"),
                 SessionOptions::read_only(project_directory.path())
                     .with_reasoning(effort)
                     .with_output_schema(schema.clone()),
@@ -898,7 +905,7 @@ async fn image_generation_session_sends_low_reasoning_effort() {
 
     let result = codex
         .run(
-            "Generate exactly one image.",
+            text_input("Generate exactly one image."),
             SessionOptions::read_only(project_directory.path())
                 .with_model("gpt-5.6-luna")
                 .with_reasoning(ReasoningEffort::Low),
@@ -922,7 +929,10 @@ async fn public_interrupt_dispatches_exact_ids_and_reaches_terminal_state() {
         .session(SessionOptions::read_only(project_directory.path()).ephemeral())
         .await
         .expect("session");
-    let run = session.start("wait for interruption").await.expect("run");
+    let run = session
+        .start(text_input("wait for interruption"))
+        .await
+        .expect("run");
     run.interrupt().await.expect("interrupt");
     let result = run.wait().await.expect("interrupted terminal result");
 
@@ -946,7 +956,10 @@ async fn repeated_interrupt_callers_share_one_provider_request() {
         .session(SessionOptions::read_only(project_directory.path()).ephemeral())
         .await
         .expect("session");
-    let run = session.start("interrupt once").await.expect("run");
+    let run = session
+        .start(text_input("interrupt once"))
+        .await
+        .expect("run");
 
     let (first, second) = tokio::time::timeout(Duration::from_secs(2), async {
         tokio::join!(run.interrupt(), run.interrupt())
@@ -985,7 +998,7 @@ async fn one_shot_run_auto_denies_approvals_and_cleans_up_the_ephemeral_session(
 
     let result = codex
         .run(
-            "Reply with OK",
+            text_input("Reply with OK"),
             SessionOptions::read_only(project_directory.path()),
         )
         .await
@@ -1042,7 +1055,7 @@ async fn one_shot_run_preserves_primary_failure_when_cleanup_also_fails() {
 
     let error = codex
         .run(
-            "fail the turn",
+            text_input("fail the turn"),
             SessionOptions::read_only(project_directory.path()),
         )
         .await
@@ -1083,7 +1096,7 @@ async fn persisted_thread_can_be_resumed_run_and_unsubscribed() {
     assert_eq!(session.id(), "thread-existing");
 
     let result = session
-        .start("Reply with OK")
+        .start(text_input("Reply with OK"))
         .await
         .expect("run")
         .wait()
@@ -1191,7 +1204,10 @@ async fn persisted_turn_audit_recovers_items_omitted_from_live_notifications() {
         .session(SessionOptions::read_only(project_directory.path()))
         .await
         .expect("persistent session");
-    let mut run = session.start("perform audited work").await.expect("run");
+    let mut run = session
+        .start(text_input("perform audited work"))
+        .await
+        .expect("run");
     let mut saw_live_command_or_file = false;
     let result = loop {
         match run
@@ -1275,7 +1291,10 @@ async fn turn_audit_rejects_invalid_session_states_without_a_read_request() {
         )
         .await
         .expect("ephemeral session");
-    let empty_prompt = ephemeral.start(" ").await.expect_err("empty prompt");
+    let empty_prompt = ephemeral
+        .start(text_input(" "))
+        .await
+        .expect_err("empty prompt");
     assert_eq!(empty_prompt.kind(), crate::ErrorKind::InvalidInput);
     let empty = ephemeral.audit_turn(" ").await.expect_err("empty turn id");
     assert_eq!(empty.kind(), crate::ErrorKind::InvalidInput);
@@ -1290,7 +1309,7 @@ async fn turn_audit_rejects_invalid_session_states_without_a_read_request() {
         .session(SessionOptions::read_only(project_directory.path()).with_model("active"))
         .await
         .expect("active session");
-    let run = active.start("wait").await.expect("active run");
+    let run = active.start(text_input("wait")).await.expect("active run");
     let active_error = active
         .audit_turn("turn-active")
         .await
@@ -2072,7 +2091,7 @@ async fn workspace_write_uses_exact_pinned_policy() {
         .await
         .expect("workspace session");
     let result = session
-        .start("verify policy")
+        .start(text_input("verify policy"))
         .await
         .expect("run")
         .wait()
@@ -2126,7 +2145,7 @@ async fn active_turn_timeout_interrupts_and_preserves_runtime_recovery() {
 
     let error = tokio::time::timeout(Duration::from_secs(2), async {
         session
-            .start("wait for deadline")
+            .start(text_input("wait for deadline"))
             .await
             .expect("run handle")
             .wait()
@@ -2166,7 +2185,7 @@ async fn cumulative_output_limit_interrupts_and_releases_the_session() {
 
     let error = tokio::time::timeout(Duration::from_secs(2), async {
         session
-            .start("bounded output")
+            .start(text_input("bounded output"))
             .await
             .expect("run handle")
             .wait()
@@ -2246,7 +2265,10 @@ async fn concurrent_sessions_route_interleaved_events_without_cross_talk() {
         .session(SessionOptions::read_only(second_project.path()).ephemeral())
         .await
         .expect("second session");
-    let (first_run, second_run) = tokio::join!(first.start("first"), second.start("second"));
+    let (first_run, second_run) = tokio::join!(
+        first.start(text_input("first")),
+        second.start(text_input("second"))
+    );
     let (first_result, second_result) = tokio::join!(
         first_run.expect("first run").wait(),
         second_run.expect("second run").wait()
@@ -2273,7 +2295,7 @@ async fn consumer_lag_is_observable_and_interrupts_the_turn() {
         .session(SessionOptions::read_only(project_directory.path()).ephemeral())
         .await
         .expect("session");
-    let mut run = session.start("overflow").await.expect("run");
+    let mut run = session.start(text_input("overflow")).await.expect("run");
     tokio::time::sleep(Duration::from_millis(150)).await;
     let mut observed_lag = false;
     while let Some(event) = run.next_event().await {
@@ -2323,7 +2345,7 @@ async fn terminal_failure_before_start_acknowledgement_does_not_leak_the_run_rou
         .expect("session");
 
     let error = session
-        .start("malformed")
+        .start(text_input("malformed"))
         .await
         .expect("run handle")
         .wait()
@@ -2354,7 +2376,7 @@ async fn pre_acknowledgement_event_overflow_interrupts_without_blocking_the_rout
 
     let error = tokio::time::timeout(Duration::from_secs(2), async {
         session
-            .start("overflow")
+            .start(text_input("overflow"))
             .await
             .expect("run handle")
             .wait()
@@ -2397,10 +2419,13 @@ async fn pre_ack_terminal_overflow_uses_the_provider_terminal_without_interrupti
         .await
         .expect("session");
 
-    let run = tokio::time::timeout(Duration::from_secs(2), session.start("terminal overflow"))
-        .await
-        .expect("terminal-before-ack routing timeout")
-        .expect("run handle");
+    let run = tokio::time::timeout(
+        Duration::from_secs(2),
+        session.start(text_input("terminal overflow")),
+    )
+    .await
+    .expect("terminal-before-ack routing timeout")
+    .expect("run handle");
     let error = run
         .wait()
         .await
@@ -2447,7 +2472,11 @@ async fn shutdown_waits_for_in_flight_turn_start_ownership() {
 
     let start_task = tokio::spawn({
         let session = Arc::clone(&session);
-        async move { session.start("start while shutdown begins").await }
+        async move {
+            session
+                .start(text_input("start while shutdown begins"))
+                .await
+        }
     });
 
     let mut request_observed = false;
@@ -2496,7 +2525,10 @@ async fn cancelling_one_shot_run_interrupts_and_unsubscribes_ephemeral_session()
         let project = project_directory.path().to_path_buf();
         async move {
             codex
-                .run("cancel this run", SessionOptions::read_only(project))
+                .run(
+                    text_input("cancel this run"),
+                    SessionOptions::read_only(project),
+                )
                 .await
         }
     });
@@ -2661,7 +2693,7 @@ async fn malformed_known_notification_fails_closed_at_the_connection_boundary() 
         .expect("session");
 
     let error = session
-        .start("malformed notification")
+        .start(text_input("malformed notification"))
         .await
         .expect("run handle")
         .wait()
@@ -2722,7 +2754,7 @@ async fn dropping_approval_sends_fail_closed_response() {
         .session(SessionOptions::read_only(project_directory.path()).ephemeral())
         .await
         .expect("session");
-    let mut run = session.start("approval").await.expect("run");
+    let mut run = session.start(text_input("approval")).await.expect("run");
     loop {
         match run.next_event().await.expect("stream").expect("event") {
             Event::ApprovalRequested(request) => {
@@ -2753,7 +2785,10 @@ async fn approval_deadline_sends_one_fail_closed_response() {
         .session(SessionOptions::read_only(project_directory.path()).ephemeral())
         .await
         .expect("session");
-    let mut run = session.start("approval deadline").await.expect("run");
+    let mut run = session
+        .start(text_input("approval deadline"))
+        .await
+        .expect("run");
     let request = loop {
         match run.next_event().await.expect("stream").expect("event") {
             Event::ApprovalRequested(request) => break request,

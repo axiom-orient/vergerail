@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use vergerail::{
     Account, Codex, CodexConfig, DownloadPolicy, Error as VergerailError, ErrorKind, Event,
-    ReasoningEffort, RuntimePackage, RuntimeResolver, SessionOptions, TurnStatus, Usage,
+    ReasoningEffort, RuntimePackage, RuntimeResolver, SessionOptions, TurnInput, TurnStatus, Usage,
 };
 
 const SCHEMA_VERSION: u8 = 1;
@@ -777,7 +777,10 @@ async fn run_audited_turn(
     session: &vergerail::Session,
     prompt: String,
 ) -> Result<(vergerail::RunResult, Vec<String>), ProviderFailure> {
-    let mut run = session.start(prompt).await.map_err(map_vergerail_error)?;
+    let mut run = session
+        .start(vec![TurnInput::text(prompt)])
+        .await
+        .map_err(map_vergerail_error)?;
     let mut violations = Vec::new();
     let result = loop {
         let event = run.next_event().await.ok_or_else(|| {

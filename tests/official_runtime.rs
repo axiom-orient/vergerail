@@ -105,14 +105,25 @@ async fn provider_runtime_verification_deadline_reaps_the_guardian_helper() {
     assert_eq!(existing_helpers, 0, "no prior verifier helper may survive");
 
     let request = serde_json::json!({
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "requestId": "runtime-helper-timeout",
         "operation": "model_turn",
-        "messages": [{"role": "user", "content": "unused"}],
+        "messages": [{
+            "role": "user",
+            "content": "unused",
+            "contentParts": [],
+            "toolCalls": [],
+            "toolCallId": null,
+            "toolName": null,
+            "isError": false
+        }],
+        "observations": [],
         "tools": [],
         "reasoning": "off",
         "timeoutMs": 100,
-        "maximumResponseBytes": 1024
+        "maximumResponseBytes": 1024,
+        "prompt": null,
+        "imageOptions": null
     });
     let started = Instant::now();
     let mut child = tokio::process::Command::new(provider_binary())

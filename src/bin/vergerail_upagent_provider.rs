@@ -8,11 +8,15 @@
 
 #![forbid(unsafe_code)]
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{self, Read as _, Write};
 use std::path::{Component, PathBuf};
@@ -20,11 +24,12 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::time::timeout;
 use vergerail::{
-    Codex, CodexConfig, DirectImageRequest, Event, ImageBackground, ImageQuality, ImageSize,
-    ReasoningEffort, Run, RunResult, RuntimePackage, SessionOptions, TurnStatus,
+    Codex, CodexConfig, DirectImageRequest, Event, ImageBackground, ImageDetail, ImageQuality,
+    ImageSize, ReasoningEffort, Run, RunResult, RuntimePackage, SessionOptions, TurnInput,
+    TurnStatus, validate_png_dimensions,
 };
 
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const MAX_REQUEST_BYTES: usize = CodexConfig::MAX_FRAME_BYTES;
 const MAX_MESSAGE_BYTES: usize = 128 * 1024;
 const MAX_MESSAGES: usize = 128;
@@ -44,6 +49,7 @@ const MAX_MODEL_SESSION_BYTES: usize = CodexConfig::MAX_FRAME_BYTES;
 const MAX_FAILURE_MESSAGE_BYTES: usize = 4 * 1024;
 const MAX_FAILURE_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_PROVIDER_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
+const STAGING_ROOT_PREFIX: &str = "vergerail-upagent-request-";
 // This cleanup budget begins only after the user-visible provider deadline.
 // It is deliberately separate from timeoutMs and bounds the final reap.
 const PROVIDER_TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
@@ -63,6 +69,12 @@ struct ProviderRequest {
     operation: ProviderOperation,
     #[serde(default)]
     messages: Vec<ProviderMessage>,
+    #[serde(default)]
+    observations: Vec<ProviderObservation>,
+    /// Exact request-specific root created and owned by UpAgent for staged
+    /// observation files. It is never copied into the model prompt.
+    #[serde(default)]
+    staging_root: Option<PathBuf>,
     #[serde(default)]
     tools: Vec<ProviderTool>,
     reasoning: ProviderReasoning,
@@ -144,6 +156,8 @@ struct ProviderMessage {
     role: ProviderMessageRole,
     content: String,
     #[serde(default)]
+    content_parts: Vec<ProviderContentPart>,
+    #[serde(default)]
     tool_calls: Vec<ProviderToolCall>,
     #[serde(default)]
     tool_call_id: Option<String>,
@@ -151,6 +165,66 @@ struct ProviderMessage {
     tool_name: Option<String>,
     #[serde(default)]
     is_error: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum ProviderContentPart {
+    Text { text: String },
+    ImageObservation { image: ProviderImageObservation },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ProviderImageObservation {
+    artifact: ProviderArtifactRef,
+    role: ProviderImageRole,
+    #[serde(default)]
+    detail: ProviderImageDetail,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    caption: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ProviderArtifactRef {
+    id: String,
+    sha256: String,
+    media_type: String,
+    byte_length: u64,
+    relative_path: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProviderImageRole {
+    Full,
+    Crop,
+    Mask,
+    AlphaCheckerboard,
+    Diff,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProviderImageDetail {
+    Low,
+    #[default]
+    Auto,
+    High,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ProviderObservation {
+    message_index: usize,
+    part_index: usize,
+    media_type: String,
+    sha256: String,
+    width: u32,
+    height: u32,
+    role: ProviderImageRole,
+    base64: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
@@ -337,6 +411,73 @@ fn absolute_clean_path(path: &std::path::Path) -> bool {
             .any(|component| component == Component::ParentDir)
 }
 
+fn validate_staging_root(path: &std::path::Path) -> ProviderResult<()> {
+    if !absolute_clean_path(path)
+        || path.parent() != Some(env::temp_dir().as_path())
+        || !path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.starts_with(STAGING_ROOT_PREFIX))
+    {
+        return Err(failure(
+            "invalid_request",
+            "stagingRoot must be an exact UpAgent request directory under the system temporary directory",
+            false,
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        failure(
+            "invalid_request",
+            &format!("stagingRoot is not an accessible request directory: {error}"),
+            false,
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(failure(
+            "invalid_request",
+            "stagingRoot must be a non-symlink directory",
+            false,
+        ));
+    }
+    let mut entries = fs::read_dir(path).map_err(|error| {
+        failure(
+            "invalid_request",
+            &format!("stagingRoot cannot be inspected safely: {error}"),
+            false,
+        )
+    })?;
+    if entries
+        .next()
+        .transpose()
+        .map_err(|error| {
+            failure(
+                "invalid_request",
+                &format!("stagingRoot cannot be inspected safely: {error}"),
+                false,
+            )
+        })?
+        .is_some()
+    {
+        return Err(failure(
+            "invalid_request",
+            "stagingRoot must be an empty request directory owned by UpAgent",
+            false,
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o7777 != 0o700 {
+            return Err(failure(
+                "invalid_request",
+                "stagingRoot must have private 0700 permissions",
+                false,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn failure(code: &'static str, message: &str, retryable: bool) -> ProviderFailure {
     ProviderFailure {
         code,
@@ -434,7 +575,7 @@ fn encode_failure_response(error: &ProviderFailure, request_id: String) -> Vec<u
                 retryable: false,
             },
         })
-        .unwrap_or_else(|_| b"{\"schemaVersion\":1,\"requestId\":\"\",\"ok\":false,\"error\":{\"code\":\"provider_failed\",\"message\":\"provider failure\",\"retryable\":false}}".to_vec()),
+        .unwrap_or_else(|_| b"{\"schemaVersion\":2,\"requestId\":\"\",\"ok\":false,\"error\":{\"code\":\"provider_failed\",\"message\":\"provider failure\",\"retryable\":false}}".to_vec()),
     }
 }
 
@@ -592,13 +733,13 @@ fn read_request() -> (ProviderResult<ProviderRequest>, String) {
 }
 
 fn validate_request(request: ProviderRequest) -> ProviderResult<ProviderRequest> {
-    if request.schema_version != 1
+    if request.schema_version != PROTOCOL_VERSION
         || request.request_id.trim().is_empty()
         || request.request_id.contains('\0')
     {
         return Err(failure(
             "invalid_request",
-            "schemaVersion must be 1 and requestId must be non-empty",
+            "schemaVersion must be 2 and requestId must be non-empty",
             false,
         ));
     }
@@ -637,10 +778,14 @@ fn validate_request(request: ProviderRequest) -> ProviderResult<ProviderRequest>
             .as_deref()
             .ok_or_else(|| failure("invalid_request", "image_generate requires prompt", false))?;
         validate_text(prompt, "prompt")?;
-        if !request.messages.is_empty() || !request.tools.is_empty() {
+        if !request.messages.is_empty()
+            || !request.observations.is_empty()
+            || !request.tools.is_empty()
+            || request.staging_root.is_some()
+        {
             return Err(failure(
                 "invalid_request",
-                "image_generate does not accept model messages or tools",
+                "image_generate does not accept model messages, observations, or tools",
                 false,
             ));
         }
@@ -663,9 +808,28 @@ fn validate_request(request: ProviderRequest) -> ProviderResult<ProviderRequest>
             false,
         ));
     }
+    if request.observations.is_empty() {
+        if request.staging_root.is_some() {
+            return Err(failure(
+                "invalid_request",
+                "stagingRoot is only valid when model_turn carries observations",
+                false,
+            ));
+        }
+    } else {
+        let staging_root = request.staging_root.as_deref().ok_or_else(|| {
+            failure(
+                "invalid_request",
+                "model_turn observations require the UpAgent-owned stagingRoot",
+                false,
+            )
+        })?;
+        validate_staging_root(staging_root)?;
+    }
     for message in &request.messages {
         validate_message(message)?;
     }
+    validate_observations(&request)?;
     let mut names = std::collections::BTreeSet::new();
     for tool in &request.tools {
         validate_bounded_text(&tool.name, "tool name", MAX_TOOL_NAME_BYTES)?;
@@ -792,6 +956,253 @@ fn validate_message(message: &ProviderMessage) -> ProviderResult<()> {
         validate_tool_call(call)?;
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct ValidatedObservation {
+    message_index: usize,
+    part_index: usize,
+    detail: ProviderImageDetail,
+    bytes: Vec<u8>,
+}
+
+fn validate_observations(request: &ProviderRequest) -> ProviderResult<()> {
+    let image_parts = request
+        .messages
+        .iter()
+        .flat_map(|message| message.content_parts.iter())
+        .filter(|part| matches!(part, ProviderContentPart::ImageObservation { .. }))
+        .count();
+    if request.observations.len() > 16 {
+        return Err(failure(
+            "resource_limit",
+            "model turn contains too many image observations",
+            false,
+        ));
+    }
+    if image_parts != request.observations.len() {
+        return Err(failure(
+            "invalid_request",
+            "every image content part must have exactly one resolved observation",
+            false,
+        ));
+    }
+    let mut aggregate_bytes = 0_usize;
+    let mut identities = std::collections::BTreeSet::new();
+    for observation in &request.observations {
+        let message = request
+            .messages
+            .get(observation.message_index)
+            .ok_or_else(|| {
+                failure(
+                    "invalid_request",
+                    "image observation message index is invalid",
+                    false,
+                )
+            })?;
+        let part = message
+            .content_parts
+            .get(observation.part_index)
+            .ok_or_else(|| {
+                failure(
+                    "invalid_request",
+                    "image observation part index is invalid",
+                    false,
+                )
+            })?;
+        let ProviderContentPart::ImageObservation { image } = part else {
+            return Err(failure(
+                "invalid_request",
+                "resolved observation does not reference an image content part",
+                false,
+            ));
+        };
+        if !identities.insert((observation.message_index, observation.part_index)) {
+            return Err(failure(
+                "invalid_request",
+                "duplicate image observation location",
+                false,
+            ));
+        }
+        validate_artifact_location(&image.artifact)?;
+        if image.artifact.media_type != "image/png"
+            || observation.media_type != image.artifact.media_type
+            || observation.role != image.role
+        {
+            return Err(failure(
+                "invalid_request",
+                "image observation metadata does not match its content part",
+                false,
+            ));
+        }
+        let expected_length = usize::try_from(image.artifact.byte_length).map_err(|_| {
+            failure(
+                "resource_limit",
+                "image observation byte length is not representable",
+                false,
+            )
+        })?;
+        if expected_length == 0
+            || expected_length > MAX_IMAGE_BYTES
+            || observation.base64.len() > MAX_IMAGE_BASE64_BYTES
+        {
+            return Err(failure(
+                "resource_limit",
+                "image observation exceeds the bounded byte limit",
+                false,
+            ));
+        }
+        let bytes = BASE64_STANDARD
+            .decode(observation.base64.as_bytes())
+            .map_err(|error| {
+                failure(
+                    "invalid_request",
+                    &format!("image observation base64 is invalid: {error}"),
+                    false,
+                )
+            })?;
+        if bytes.is_empty() || bytes.len() != expected_length || bytes.len() > MAX_IMAGE_BYTES {
+            return Err(failure(
+                "invalid_request",
+                "image observation decoded length does not match its artifact",
+                false,
+            ));
+        }
+        if observation.sha256 != image.artifact.sha256
+            || !is_lower_hex_digest(&observation.sha256)
+            || sha256_hex(&bytes) != observation.sha256
+        {
+            return Err(failure(
+                "invalid_request",
+                "image observation bytes do not match their SHA-256 identity",
+                false,
+            ));
+        }
+        let (width, height) = validate_png_dimensions(&bytes).map_err(|error| {
+            failure(
+                "invalid_request",
+                &format!("image observation PNG validation failed: {error}"),
+                false,
+            )
+        })?;
+        if observation.width != width || observation.height != height {
+            return Err(failure(
+                "invalid_request",
+                "image observation dimensions do not match the PNG payload",
+                false,
+            ));
+        }
+        aggregate_bytes = aggregate_bytes.checked_add(bytes.len()).ok_or_else(|| {
+            failure(
+                "resource_limit",
+                "image observation aggregate byte count overflowed",
+                false,
+            )
+        })?;
+        if aggregate_bytes > 32 * 1024 * 1024 {
+            return Err(failure(
+                "resource_limit",
+                "image observations exceed the 32 MiB aggregate byte bound",
+                false,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validated_observations(request: &ProviderRequest) -> ProviderResult<Vec<ValidatedObservation>> {
+    validate_observations(request)?;
+    let mut observations = Vec::with_capacity(request.observations.len());
+    for observation in &request.observations {
+        let message = request
+            .messages
+            .get(observation.message_index)
+            .ok_or_else(|| {
+                failure(
+                    "invalid_request",
+                    "image observation message index is invalid",
+                    false,
+                )
+            })?;
+        let part = message
+            .content_parts
+            .get(observation.part_index)
+            .ok_or_else(|| {
+                failure(
+                    "invalid_request",
+                    "image observation part index is invalid",
+                    false,
+                )
+            })?;
+        let ProviderContentPart::ImageObservation { image } = part else {
+            return Err(failure(
+                "invalid_request",
+                "resolved observation does not reference an image content part",
+                false,
+            ));
+        };
+        let bytes = BASE64_STANDARD
+            .decode(observation.base64.as_bytes())
+            .map_err(|error| {
+                failure(
+                    "invalid_request",
+                    &format!("image observation base64 is invalid: {error}"),
+                    false,
+                )
+            })?;
+        observations.push(ValidatedObservation {
+            message_index: observation.message_index,
+            part_index: observation.part_index,
+            detail: image.detail,
+            bytes,
+        });
+    }
+    observations.sort_by_key(|observation| (observation.message_index, observation.part_index));
+    Ok(observations)
+}
+
+fn validate_artifact_location(artifact: &ProviderArtifactRef) -> ProviderResult<()> {
+    if artifact.id.is_empty()
+        || artifact.id.len() > 512
+        || artifact.id.bytes().any(|byte| byte.is_ascii_control())
+        || artifact.relative_path.is_empty()
+        || artifact.relative_path.len() > 4096
+        || artifact.relative_path.contains('\0')
+    {
+        return Err(failure(
+            "invalid_request",
+            "image artifact location metadata is invalid",
+            false,
+        ));
+    }
+    let path = std::path::Path::new(&artifact.relative_path);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(failure(
+            "invalid_request",
+            "image artifact relativePath must stay within its artifact root",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn validate_tool_call(call: &ProviderToolCall) -> ProviderResult<()> {
@@ -960,28 +1371,48 @@ async fn run_model_turn(
     request: &ProviderRequest,
     deadline: Instant,
 ) -> ProviderResult<Response> {
-    let rendered = render_model_prompt(request)?;
-    let output_schema = model_output_schema(request)?;
-    let mut options = SessionOptions::read_only(&config.workspace)
-        .with_model(&config.model)
-        .with_reasoning(map_reasoning(request.reasoning))
-        .with_turn_timeout(remaining_provider_timeout(deadline)?)
-        .with_maximum_output_bytes(model_session_bytes(request.maximum_response_bytes))
-        .with_output_schema(output_schema)
-        .text_only();
+    let validated = validated_observations(request)?;
+    let mut staging = ObservationStaging::create(&validated, request.staging_root.as_deref())?;
+    let rendered = match render_model_prompt(request, &staging.entries) {
+        Ok(rendered) => rendered,
+        Err(error) => return finish_with_staging_cleanup(&mut staging, Err(error)),
+    };
+    let output_schema = match model_output_schema(request) {
+        Ok(output_schema) => output_schema,
+        Err(error) => return finish_with_staging_cleanup(&mut staging, Err(error)),
+    };
+    let mut options = match remaining_provider_timeout(deadline) {
+        Ok(remaining) => SessionOptions::read_only(&config.workspace)
+            .with_model(&config.model)
+            .with_reasoning(map_reasoning(request.reasoning))
+            .with_turn_timeout(remaining)
+            .with_maximum_output_bytes(model_session_bytes(request.maximum_response_bytes))
+            .with_output_schema(output_schema)
+            .text_only(),
+        Err(error) => return finish_with_staging_cleanup(&mut staging, Err(error)),
+    };
     if let Some(base) = rendered.base_instructions {
         options = options.with_base_instructions(base);
     }
     if let Some(developer) = rendered.developer_instructions {
         options = options.with_developer_instructions(developer);
     }
-    let session = codex
-        .session(options)
-        .await
-        .map_err(|error| classify_vergerail_error(&error.to_string(), error.kind()))?;
+    let session = match codex.session(options).await {
+        Ok(session) => session,
+        Err(error) => {
+            let provider_error = classify_vergerail_error(&error.to_string(), error.kind());
+            return finish_with_staging_cleanup(&mut staging, Err(provider_error));
+        }
+    };
+    let mut inputs = vec![TurnInput::text(rendered.prompt)];
+    inputs.extend(
+        staging.entries.iter().map(|entry| {
+            TurnInput::local_image(entry.path.clone(), Some(image_detail(entry.detail)))
+        }),
+    );
     let verification = async {
         let run = session
-            .start(rendered.prompt)
+            .start(inputs)
             .await
             .map_err(|error| classify_vergerail_error(&error.to_string(), error.kind()))?;
         let result = wait_for_text_only_run(run).await?;
@@ -1063,15 +1494,61 @@ async fn run_model_turn(
     }
     .await;
     let close = session.close().await;
-    match (verification, close) {
-        (Ok(response), Ok(())) => Ok(response),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(classify_vergerail_error(&error.to_string(), error.kind())),
-        (Err(operation_error), Err(close_error)) => Err(failure(
+    let close = close.map_err(|error| classify_vergerail_error(&error.to_string(), error.kind()));
+    let cleanup = staging.cleanup();
+    match (verification, close, cleanup) {
+        (Ok(response), Ok(()), Ok(())) => Ok(response),
+        (Err(error), Ok(()), Ok(())) => Err(error),
+        (Ok(_), Err(error), Ok(())) => Err(error),
+        (Err(operation_error), Err(close_error), Ok(())) => Err(failure(
             operation_error.code,
             &format!(
                 "{}; model session close also failed: {}",
-                operation_error.message, close_error
+                operation_error.message, close_error.message
+            ),
+            false,
+        )),
+        (Ok(_), Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(operation_error), Ok(()), Err(cleanup_error)) => Err(failure(
+            operation_error.code,
+            &format!(
+                "{}; observation staging cleanup also failed: {}",
+                operation_error.message, cleanup_error.message
+            ),
+            false,
+        )),
+        (Ok(_), Err(close_error), Err(cleanup_error)) => Err(failure(
+            cleanup_error.code,
+            &format!(
+                "model session close failed: {}; observation staging cleanup also failed: {}",
+                close_error.message, cleanup_error.message
+            ),
+            false,
+        )),
+        (Err(operation_error), Err(close_error), Err(cleanup_error)) => Err(failure(
+            operation_error.code,
+            &format!(
+                "{}; model session close also failed: {}; observation staging cleanup also failed: {}",
+                operation_error.message, close_error.message, cleanup_error.message
+            ),
+            false,
+        )),
+    }
+}
+
+fn finish_with_staging_cleanup<T>(
+    staging: &mut ObservationStaging,
+    result: ProviderResult<T>,
+) -> ProviderResult<T> {
+    match (result, staging.cleanup()) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => Err(failure(
+            error.code,
+            &format!(
+                "{}; observation staging cleanup also failed: {}",
+                error.message, cleanup_error.message
             ),
             false,
         )),
@@ -1079,7 +1556,7 @@ async fn run_model_turn(
 }
 
 async fn wait_for_text_only_run(mut run: Run) -> ProviderResult<RunResult> {
-    let mut live_violation = None;
+    let mut live_violation: Option<String> = None;
     while let Some(event) = run.next_event().await {
         match event.map_err(|error| classify_vergerail_error(&error.to_string(), error.kind()))? {
             Event::Started | Event::TextDelta(_) | Event::UsageUpdated(_) => {}
@@ -1088,23 +1565,24 @@ async fn wait_for_text_only_run(mut run: Run) -> ProviderResult<RunResult> {
                     .deny()
                     .await
                     .map_err(|error| classify_vergerail_error(&error.to_string(), error.kind()))?;
-                live_violation.get_or_insert("approval request");
+                live_violation.get_or_insert_with(|| "approval request".into());
             }
             Event::Command(_) | Event::CommandOutput(_) => {
-                live_violation.get_or_insert("command execution");
+                live_violation.get_or_insert_with(|| "command execution".into());
             }
             Event::FileChange(_) => {
-                live_violation.get_or_insert("file change");
+                live_violation.get_or_insert_with(|| "file change".into());
             }
             Event::ImageGeneration(_) => {
-                live_violation.get_or_insert("image generation");
+                live_violation.get_or_insert_with(|| "image generation".into());
             }
             Event::Warning(_) => {
-                live_violation.get_or_insert("runtime warning");
+                live_violation.get_or_insert_with(|| "runtime warning".into());
             }
             Event::Unknown(event) if is_allowed_text_only_lifecycle(&event.method) => {}
-            Event::Unknown(_) => {
-                live_violation.get_or_insert("unsupported runtime event");
+            Event::Unknown(event) => {
+                live_violation
+                    .get_or_insert_with(|| format!("unsupported runtime event {}", event.method));
             }
             Event::Completed(result) => {
                 if let Some(violation) = live_violation {
@@ -1120,7 +1598,7 @@ async fn wait_for_text_only_run(mut run: Run) -> ProviderResult<RunResult> {
                 return Err(classify_vergerail_error(&error.to_string(), error.kind()));
             }
             _ => {
-                live_violation.get_or_insert("unsupported runtime event");
+                live_violation.get_or_insert_with(|| "unsupported runtime event".into());
             }
         }
     }
@@ -1134,7 +1612,11 @@ async fn wait_for_text_only_run(mut run: Run) -> ProviderResult<RunResult> {
 fn is_allowed_text_only_lifecycle(method: &str) -> bool {
     matches!(
         method,
-        "thread/status/changed" | "item/started" | "item/completed" | "turn/diff/updated"
+        "thread/status/changed"
+            | "item/started"
+            | "item/completed"
+            | "turn/diff/updated"
+            | "mcpServer/startupStatus/updated"
     )
 }
 
@@ -1283,23 +1765,214 @@ fn provider_image_from_response(
     })
 }
 
+#[derive(Debug)]
+struct StagedObservation {
+    message_index: usize,
+    part_index: usize,
+    detail: ProviderImageDetail,
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+struct ObservationStaging {
+    root: Option<PathBuf>,
+    entries: Vec<StagedObservation>,
+    cleaned: bool,
+}
+
+impl ObservationStaging {
+    fn create(
+        observations: &[ValidatedObservation],
+        requested_root: Option<&std::path::Path>,
+    ) -> ProviderResult<Self> {
+        if observations.is_empty() {
+            if requested_root.is_some() {
+                return Err(failure(
+                    "invalid_request",
+                    "stagingRoot is only valid when observations are present",
+                    false,
+                ));
+            }
+            return Ok(Self {
+                root: None,
+                entries: Vec::new(),
+                cleaned: true,
+            });
+        }
+        let root = requested_root.ok_or_else(|| {
+            failure(
+                "invalid_request",
+                "observations require the UpAgent-owned stagingRoot",
+                false,
+            )
+        })?;
+        validate_staging_root(root)?;
+        let mut staging = Self {
+            root: Some(root.to_owned()),
+            entries: Vec::with_capacity(observations.len()),
+            cleaned: false,
+        };
+        let result = (|| -> ProviderResult<()> {
+            for (index, observation) in observations.iter().enumerate() {
+                let path = root.join(format!("observation-{index}.png"));
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .map_err(|error| {
+                        failure(
+                            "provider_failed",
+                            &format!("could not create private image staging file: {error}"),
+                            false,
+                        )
+                    })?;
+                set_private_file_permissions(&file).map_err(|error| {
+                    failure(
+                        "provider_failed",
+                        &format!("could not secure private image staging file: {error}"),
+                        false,
+                    )
+                })?;
+                file.write_all(&observation.bytes).map_err(|error| {
+                    failure(
+                        "provider_failed",
+                        &format!("could not write private image staging file: {error}"),
+                        false,
+                    )
+                })?;
+                file.sync_all().map_err(|error| {
+                    failure(
+                        "provider_failed",
+                        &format!("could not flush private image staging file: {error}"),
+                        false,
+                    )
+                })?;
+                staging.entries.push(StagedObservation {
+                    message_index: observation.message_index,
+                    part_index: observation.part_index,
+                    detail: observation.detail,
+                    path,
+                });
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            return finish_with_staging_cleanup(&mut staging, Err(error));
+        }
+        Ok(staging)
+    }
+
+    fn cleanup(&mut self) -> ProviderResult<()> {
+        if self.cleaned {
+            return Ok(());
+        }
+        let Some(root) = self.root.as_deref() else {
+            self.cleaned = true;
+            return Ok(());
+        };
+        match fs::remove_dir_all(root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(failure(
+                    "provider_failed",
+                    &format!("could not remove private image staging directory: {error}"),
+                    false,
+                ));
+            }
+        }
+        self.cleaned = true;
+        Ok(())
+    }
+}
+
+fn set_private_file_permissions(file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn image_detail(detail: ProviderImageDetail) -> ImageDetail {
+    match detail {
+        ProviderImageDetail::Low => ImageDetail::Low,
+        ProviderImageDetail::Auto => ImageDetail::Auto,
+        ProviderImageDetail::High => ImageDetail::High,
+    }
+}
+
 struct RenderedModelPrompt {
     prompt: String,
     base_instructions: Option<String>,
     developer_instructions: Option<String>,
 }
 
-fn render_model_prompt(request: &ProviderRequest) -> ProviderResult<RenderedModelPrompt> {
+fn render_prompt_message(
+    message_index: usize,
+    message: &ProviderMessage,
+    observations: &[StagedObservation],
+) -> ProviderResult<Value> {
+    let mut value = serde_json::to_value(message).map_err(|error| {
+        failure(
+            "invalid_request",
+            &format!("could not encode provider-neutral message: {error}"),
+            false,
+        )
+    })?;
+    let mut parts = Vec::with_capacity(message.content_parts.len());
+    for (part_index, part) in message.content_parts.iter().enumerate() {
+        match part {
+            ProviderContentPart::Text { text } => {
+                parts.push(serde_json::json!({"type": "text", "text": text}));
+            }
+            ProviderContentPart::ImageObservation { image } => {
+                let observation_index = observations
+                    .iter()
+                    .position(|observation| {
+                        observation.message_index == message_index
+                            && observation.part_index == part_index
+                    })
+                    .ok_or_else(|| {
+                        failure(
+                            "invalid_request",
+                            "image prompt mapping is missing a staged observation",
+                            false,
+                        )
+                    })?;
+                parts.push(serde_json::json!({
+                    "type": "imageObservation",
+                    "observationIndex": observation_index,
+                    "role": image.role,
+                    "detail": image.detail,
+                    "caption": image.caption,
+                }));
+            }
+        }
+    }
+    if !parts.is_empty() {
+        value["contentParts"] = Value::Array(parts);
+    }
+    Ok(value)
+}
+
+fn render_model_prompt(
+    request: &ProviderRequest,
+    observations: &[StagedObservation],
+) -> ProviderResult<RenderedModelPrompt> {
     let mut base = Vec::new();
     let mut developer = Vec::new();
     let mut transcript = Vec::new();
-    for message in &request.messages {
+    for (message_index, message) in request.messages.iter().enumerate() {
         match message.role {
             ProviderMessageRole::System => base.push(message.content.clone()),
             ProviderMessageRole::Developer => developer.push(message.content.clone()),
             ProviderMessageRole::User
             | ProviderMessageRole::Assistant
-            | ProviderMessageRole::Tool => transcript.push(message),
+            | ProviderMessageRole::Tool => {
+                transcript.push(render_prompt_message(message_index, message, observations)?);
+            }
         }
     }
     let envelope = serde_json::json!({
@@ -1853,17 +2526,20 @@ mod tests {
 
     fn request(operation: ProviderOperation) -> ProviderRequest {
         ProviderRequest {
-            schema_version: 1,
+            schema_version: 2,
             request_id: "request-1".to_owned(),
             operation,
             messages: vec![ProviderMessage {
                 role: ProviderMessageRole::User,
                 content: "hello".to_owned(),
+                content_parts: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_name: None,
                 is_error: false,
             }],
+            observations: Vec::new(),
+            staging_root: None,
             tools: Vec::new(),
             reasoning: ProviderReasoning::Medium,
             timeout_ms: 1_000,
@@ -1877,7 +2553,7 @@ mod tests {
     fn request_validation_is_strict_and_bounded() {
         let valid = validate_request(request(ProviderOperation::ModelTurn))
             .expect("model turn with provider-neutral messages is valid");
-        assert_eq!(valid.schema_version, 1);
+        assert_eq!(valid.schema_version, PROTOCOL_VERSION);
 
         let mut image = request(ProviderOperation::ImageGenerate);
         image.messages.clear();
@@ -2717,7 +3393,7 @@ mod tests {
 
     #[test]
     fn protocol_schema_is_versioned() {
-        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 
     #[test]
@@ -2727,6 +3403,7 @@ mod tests {
             "item/started",
             "item/completed",
             "turn/diff/updated",
+            "mcpServer/startupStatus/updated",
         ] {
             assert!(is_allowed_text_only_lifecycle(method), "{method}");
         }

@@ -93,8 +93,8 @@ scripts/clean.sh
 Vergerail에는 별도 cleanup-inventory script가 없다. 삭제 전에는 root에서 Git 상태와
 script가 다루는 후보를 직접 확인한다.
 
-`scripts/verify.sh`의 legacy guard는 retired dedicated-home 표면만 검사하며
-upstream `CODEX_HOME`은 허용한다. guard survivor negative fixture는 production
+`scripts/verify.sh`의 dedicated-home guard는 제거된 전용 home 표면만 검사하며
+upstream `CODEX_HOME`은 허용한다. guardian survivor negative fixture는 production
 guardian에 유출되지 않고 canonical package에 포함된다.
 
 ```bash

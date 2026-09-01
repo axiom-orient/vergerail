@@ -15,7 +15,7 @@ stdio JSONL 경계다. library와 두 개의 one-shot provider binary를 제공�
 | 경로 | 책임 |
 | --- | --- |
 | `src/` | typed client, session, runtime, image adapter |
-| `src/bin/vergerail_upagent_provider.rs` | UpAgent `vergerail.upagent/1` one-shot provider |
+| `src/bin/vergerail_upagent_provider.rs` | UpAgent `vergerail.upagent/2` one-shot provider |
 | `src/bin/ifsc_text_provider.rs` | IFSC `ScreenProgram` one-shot text provider |
 | `runtime/`, `protocol/` | 공식 `0.150.1` runtime lock과 app-server schema |
 | `tests/`, `examples/` | protocol·runtime 계약과 human-controlled live E2E |
@@ -58,6 +58,26 @@ async fn main() -> vergerail::Result<()> {
 }
 ```
 
+`Session::start`와 `Codex::run`은 문자열 prompt가 아니라 순서가 보존되는
+`Vec<TurnInput>`을 받는다. text와 local image를 한 turn에 섞을 수 있으며, image
+path는 absolute regular file이어야 한다. `LocalImage`는 app-server의 typed
+`localImage` 입력으로 그대로 전달된다.
+
+```rust,no_run
+use vergerail::{ImageDetail, SessionOptions, TurnInput};
+
+let session = codex
+    .session(SessionOptions::read_only("/absolute/workspace").ephemeral())
+    .await?;
+let run = session
+    .start(vec![
+        TurnInput::text("Describe this image."),
+        TurnInput::local_image("/absolute/workspace/image.png", Some(ImageDetail::Auto)),
+    ])
+    .await?;
+let result = run.wait().await?;
+```
+
 기본 library와 provider 설정은 Codex가 선택한 account를 그대로 사용한다. 별도의
 Vergerail account 경로는 없으며, upstream `CODEX_HOME`이 설정돼 있으면 공식
 app-server가 그 값을 해석한다. Vergerail은 credential을 복사하거나 생성하지 않는다.
@@ -85,7 +105,8 @@ deadline에 포함되지 않는다. 자세한 field, 오류, timeout, cancellati
 
 `ifsc_text_provider`는 `VERGERAIL_WORKSPACE`와 `VERGERAIL_MODEL`이 필요하고,
 `VERGERAIL_CODEX_PACKAGE` 및 명시적 runtime download 정책을 선택한다. 이 binary의
-입력과 `ScreenProgram` 검증은 [IFSC provider](docs/IFSC_TEXT_PROVIDER.md)에 있다.
+입력은 별도의 IFSC `ScreenProgram` `schemaVersion: 1` 계약이며, UpAgent provider
+계약과 섞이지 않는다. `ScreenProgram` 검증은 [IFSC provider](docs/IFSC_TEXT_PROVIDER.md)에 있다.
 
 ## 문서
 
@@ -98,3 +119,7 @@ deadline에 포함되지 않는다. 자세한 field, 오류, timeout, cancellati
 - [Security](SECURITY.md): 인증, 권한, credential과 process 경계
 
 라이선스는 Apache-2.0이다.
+
+## GitHub 배포 분류
+
+VergeRail의 주 제품은 개발자가 import해 protocol·provider를 조합하는 Rust 라이브러리이므로 canonical 조직은 [`axiom-orient`](https://github.com/axiom-orient)다. 보조 binary와 예제는 SDK 분류를 바꾸지 않는다.
