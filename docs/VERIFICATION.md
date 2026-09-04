@@ -61,6 +61,7 @@ live 흐름은 account가 ChatGPT인지 확인하고, visible model을 조회한
 - one-shot text, persistent session, resume, interruption
 - text-only/read-only/workspace-write 권한 경계와 root confinement
 - direct image generation의 실제 PNG와 `gpt-image-2` adapter 경계
+- `vergerail.upagent/2` resolved observation validation과 pinned native typed image input
 - PerfectPixel inspect, chroma plan, image conversion, PSD export
 - diagnostics 부재, provider/PerfectPixel process cleanup, delayed survivor 부재
 

@@ -12,7 +12,7 @@ Vergerail은 검증된 Codex app-server package와 Rust caller 사이의 좁은 
 | `session.rs` | sandbox, instruction, event, approval, terminal/audit 계약 |
 | `private/process.rs` | stdio transport, task custody, bounded shutdown |
 | `private/process_tree.rs` | owner-only guardian 추출과 process-tree 종료 |
-| provider binaries | stdin JSON 검증, 단일 요청 실행, stdout typed JSON |
+| provider binaries | stdin `vergerail.upagent/2` 검증, 단일 요청 실행, stdout typed JSON |
 
 `Codex::generate_image()`는 session 경계와 별개인 비멱등 이미지 요청입니다.
 공식 app-server의 `getAuthStatus(includeToken=true, refreshToken=true)` 결과에서
@@ -56,7 +56,7 @@ Vergerail은 표준 Codex 설정이나 credential을 수정하지 않습니다. 
 
 ## 세션과 종료
 
-각 session은 sandbox, persistence, instruction, output schema, turn deadline과 retained-output 상한을 소유합니다. read-only text/image adapter는 허용하지 않은 command, file change, approval 또는 외부 surface를 관찰하면 실패합니다. persistent success는 durable audit과 대조합니다.
+각 session은 sandbox, persistence, instruction, output schema, turn deadline과 retained-output 상한을 소유합니다. read-only text/image adapter는 허용하지 않은 command, file change, approval 또는 외부 surface를 관찰하면 실패합니다. persistent success는 durable audit과 대조합니다. UpAgent의 v2 provider sidecar는 session 생성 전에 검증되고, image bytes는 typed native `turn/start` input으로만 전달됩니다.
 
 `Session::close()`와 `Codex::shutdown()`은 owned request/task/process를 닫고 guardian을 reap한 뒤 helper와 임시 디렉터리를 제거합니다. provider는 사용자 operation deadline의 남은 시간으로 shutdown을 시도하고, deadline이 이미 만료되면 별도의 고정 2초 teardown budget으로 bounded cleanup을 시도합니다. 이 teardown budget은 `timeoutMs`에 포함되지 않습니다. timeout, cancellation, panic과 partial spawn도 같은 cleanup 경계를 사용합니다. PID만 기억한 신호나 system-wide process 검색은 사용하지 않습니다.
 
