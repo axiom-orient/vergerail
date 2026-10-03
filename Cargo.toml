@@ -6,7 +6,6 @@ rust-version = "1.97.1"
 description = "A pinned, type-safe Rust bridge to OpenAI Codex app-server"
 publish = false
 readme = "README.md"
-license = "Apache-2.0"
 repository = "https://github.com/axiom-orient/vergerail"
 homepage = "https://github.com/axiom-orient/vergerail"
 documentation = "https://github.com/axiom-orient/vergerail/tree/main/docs"
@@ -24,7 +23,6 @@ include = [
     "runtime/**",
     "scripts/*.sh",
     "README.md",
-    "LICENSE",
     "NOTICE",
     "THIRD_PARTY_NOTICES.md",
     "SECURITY.md",

@@ -13,7 +13,7 @@ The upstream Codex notice states:
 > Copyright (c) 2016-2022 Florian Dehau
 > Copyright (c) 2023-2025 The Ratatui Developers
 
-The repository's `NOTICE` and `LICENSE` files remain the authoritative local
-notices and license text. This file does not add a claim about dependencies
-outside the pinned source material; Cargo dependency licensing is checked by
-`cargo deny`.
+The repository's `NOTICE` remains the local attribution record for the pinned
+third-party source. Cargo dependency licensing is checked by `cargo deny`.
+This file does not add a claim about dependencies outside the pinned source
+material.
